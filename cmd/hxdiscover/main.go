@@ -265,6 +265,24 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 	case "tree":
 		match := os.Getenv(matchEnv)
 		cmd = func(data []byte) error { return folderTree(data, probeRedactor, match, w) }
+	case "sizes":
+		cmd = func(data []byte) error { return typeSizes(data, []uint16{0xcc, 0xcd, 0xce, 0x154, 0x168, 0x2f6}, w) }
+	case "bytecand":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return byteCandidates(data, v, 1900, w) }
+	case "ticks":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		t, err := parseHex(*typeHex, 16)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return probeTicks(data, v, uint16(t), now, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":
