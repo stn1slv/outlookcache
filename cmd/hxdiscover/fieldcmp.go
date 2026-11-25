@@ -3,12 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/stn1slv/outlookcache/internal/hxstore"
@@ -84,133 +82,4 @@ func fieldCompare(data []byte, typ uint16, w io.Writer) error {
 func textUnit(v uint16) bool {
 	r := rune(v)
 	return unicode.IsLetter(r) || unicode.IsDigit(r)
-}
-
-// typeSizes prints, for each given type, how many IDs have a last copy of
-// each size class (empty = the smallest size seen for that type).
-func typeSizes(data []byte, types []uint16, w io.Writer) error {
-	last := map[uint16]map[uint64]int{}
-	for _, t := range types {
-		last[t] = map[uint64]int{}
-	}
-	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		forEachFraming(b.Payload, func(_ int, id uint64, typ uint16, obj []byte) {
-			if m, ok := last[typ]; ok {
-				m[id] = len(obj)
-			}
-		})
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	for _, t := range types {
-		minSize := -1
-		for _, n := range last[t] {
-			if minSize < 0 || n < minSize {
-				minSize = n
-			}
-		}
-		empty := 0
-		for _, n := range last[t] {
-			if n == minSize {
-				empty++
-			}
-		}
-		_, _ = fmt.Fprintf(w, "type=0x%04x ids=%d smallest size=%d ids with smallest size=%d\n", t, len(last[t]), minSize, empty)
-	}
-	return nil
-}
-
-// byteCandidates compares one object (the last 0xc7 copy with this ID)
-// with the last copy of every other 0xc7 object of the same form (with or
-// without an account ID at +32) and prints byte offsets where the target
-// differs from a value that at least 80% of the population share. Only
-// offsets, byte values and shares are printed.
-func byteCandidates(data []byte, target uint64, limit int, w io.Writer) error {
-	last := map[uint64][]byte{}
-	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		forEachFraming(b.Payload, func(_ int, id uint64, typ uint16, obj []byte) {
-			if typ == 0xc7 && len(obj) >= msgMinLen {
-				last[id] = obj
-			}
-		})
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	t, ok := last[target]
-	if !ok {
-		return fmt.Errorf("no 0xc7 object with id %x", target)
-	}
-	form := isID(binary.LittleEndian.Uint64(t[msgAccountAt:]))
-	var pop [][]byte
-	for id, o := range last {
-		if id != target && isID(binary.LittleEndian.Uint64(o[msgAccountAt:])) == form {
-			pop = append(pop, o)
-		}
-	}
-	mask := textMask(t)
-	_, _ = fmt.Fprintf(w, "target form message=%t population=%d\n", form, len(pop))
-	for i := 0; i < min(limit, len(t)); i++ {
-		if mask[i] {
-			continue
-		}
-		var hist [256]int
-		n := 0
-		for _, o := range pop {
-			if i < len(o) {
-				hist[o[i]]++
-				n++
-			}
-		}
-		top := 0
-		for v := range hist {
-			if hist[v] > hist[top] {
-				top = v
-			}
-		}
-		if n > 0 && hist[top]*5 >= n*4 && byte(top) != t[i] {
-			_, _ = fmt.Fprintf(w, "+%d target=%02x majority=%02x share=%.3f population with target value=%d\n",
-				i, t[i], top, float64(hist[top])/float64(n), hist[t[i]])
-		}
-	}
-	return nil
-}
-
-// probeTicks prints the offsets and exact UTC times of all u64 values in
-// the last copy of one object that decode as .NET ticks within the last 90
-// days. It refuses objects that do not contain the synthetic marker, so
-// only times of probe mails are printed.
-func probeTicks(data []byte, target uint64, typ uint16, now time.Time, w io.Writer) error {
-	var obj []byte
-	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		forEachFraming(b.Payload, func(_ int, id uint64, t uint16, o []byte) {
-			if id == target && t == typ {
-				obj = o
-			}
-		})
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if obj == nil {
-		return fmt.Errorf("no object %x of type %#x", target, typ)
-	}
-	if !bytes.Contains(asciiLower(obj), encodeU16(markerPrefix)) {
-		return errors.New("object has no oc-probe marker; refusing to print times")
-	}
-	for i := 0; i+8 <= len(obj); i++ {
-		v := binary.LittleEndian.Uint64(obj[i:])
-		if v < ticksUnixEpoch {
-			continue
-		}
-		ts := ticksToTime(v)
-		if ts.After(now.AddDate(0, 0, -90)) && ts.Before(now.Add(time.Hour)) {
-			_, _ = fmt.Fprintf(w, "+%d %s\n", i, ts.UTC().Format(time.RFC3339Nano))
-		}
-	}
-	return nil
 }

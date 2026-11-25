@@ -107,10 +107,11 @@ func findName(p, low []byte, key uint64, n needle, counts map[string]int) {
 	}
 }
 
-// addrCount counts the current message copies per folder (live-block rule,
-// see liveIndex.current) and how many of them contain the given text in
-// UTF-16LE (ASCII case ignored), to test where an account's own address is
-// stored. Only counts are printed.
+// addrCount counts the current message items per folder (current-copy
+// rule, see liveIndex.current; deleted items are included because no
+// reliable deletion signal is known) and how many of them contain the given
+// text in UTF-16LE (ASCII case ignored), to test where an account's own
+// address is stored. Only counts are printed.
 func addrCount(data []byte, text string, w io.Writer) error {
 	if text == "" {
 		return errors.New("addrcount needs a non-empty text")
@@ -119,29 +120,21 @@ func addrCount(data []byte, text string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	n := needles(text)[0]
-	copies := map[uint64][]c7copy{}
-	if _, err := scanMessages(data, func(c c7copy, folderOK bool) {
-		if folderOK {
-			copies[c.id] = append(copies[c.id], c)
-		}
-	}); err != nil {
+	cur, err := currentC7(data, li, false)
+	if err != nil {
 		return err
 	}
+	n := needles(text)[0]
 	counts := map[string]int{}
-	for _, cs := range copies {
-		c, _, ambiguous := li.current(cs)
+	for _, c := range cur {
 		counts[fmt.Sprintf("folder %x total", c.folder)]++
-		if ambiguous {
-			counts[fmt.Sprintf("folder %x ambiguous current copy", c.folder)]++
-		}
 		hit := map[string]int{}
 		findName(c.obj, asciiLower(c.obj), 0, n, hit)
 		if len(hit) > 0 {
 			counts[fmt.Sprintf("folder %x contains text", c.folder)]++
 		}
 	}
-	printCounts(w, "messages per folder (text not printed)", counts)
+	printCounts(w, "message items per folder (text not printed)", counts)
 	return nil
 }
 

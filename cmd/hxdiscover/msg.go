@@ -35,6 +35,7 @@ type c7copy struct {
 	stamp        uint64
 	status, flag byte
 	folder       uint64
+	conv         uint64 // items only: conversation ID at +436, 0 when not an ID
 	block        int64
 	key          uint64
 	obj          []byte
@@ -58,10 +59,10 @@ func forEachFraming(p []byte, fn func(o int, id uint64, typ uint16, obj []byte))
 	}
 }
 
-// scanMessages calls fn for every message-form 0xc7 copy (account ID at
+// scanConversations calls fn for every conversation-form 0xc7 copy (account ID at
 // +32, length >= 1800). folderOK is false for the other layout that has no
 // folder ID at +1166.
-func scanMessages(data []byte, fn func(c c7copy, folderOK bool)) (hxstore.Stats, error) {
+func scanConversations(data []byte, fn func(c c7copy, folderOK bool)) (hxstore.Stats, error) {
 	st, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		forEachFraming(b.Payload, func(_ int, id uint64, typ uint16, obj []byte) {
 			if typ != 0xc7 || len(obj) < msgMinLen || !isID(binary.LittleEndian.Uint64(obj[msgAccountAt:])) {

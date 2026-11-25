@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -160,4 +161,50 @@ func TestMatchCommandsNeedEnv(t *testing.T) { //nolint:paralleltest // t.Setenv
 	}
 	err := run(context.Background(), []string{"framesin", "-file", f}, &bytes.Buffer{})
 	assert.ErrorContains(t, err, "-block")
+}
+
+func TestProbeSubject(t *testing.T) {
+	t.Parallel()
+	assert.True(t, probeSubject(append([]byte{5, 0, 0, 0}, encodeU16("RE: oc-probe-6 fields")...)))
+	assert.True(t, probeSubject(encodeU16("oc-probe-1 plain")))
+	assert.False(t, probeSubject(encodeU16("Quarterly report from oc-probe team")))
+	assert.False(t, probeSubject([]byte("oc-probe-1 plain"))) // UTF-8 body text is not a subject
+}
+
+func TestProbeTicksNeedsOptIn(t *testing.T) {
+	t.Parallel()
+	err := probeTicks(nil, 1, false, time.Now(), &bytes.Buffer{})
+	assert.ErrorContains(t, err, "-ticks")
+}
+
+func TestCheckpointStampIgnoresTopMatches(t *testing.T) {
+	t.Parallel()
+	li := liveIndex{areas: [2]map[uint32]bool{{}, {}}}
+	copies := map[uint64][]c7copy{}
+	for i := range 8 {
+		li.areas[0][uint32(i+1)] = true
+		copies[uint64(i)] = []c7copy{{block: int64(i+1) * 256, stamp: uint64(100 + i)}}
+	}
+	assert.Equal(t, uint64(102), checkpointStamp(copies, li), "the 5 highest are ignored")
+	assert.Zero(t, checkpointStamp(map[uint64][]c7copy{1: {{block: 256, stamp: 9}}}, li), "too few indexed copies")
+}
+
+func TestScanItemsAcceptsShortItems(t *testing.T) {
+	t.Parallel()
+	obj := make([]byte, itemMinLen)
+	copy(obj, objMagic)
+	binary.LittleEndian.PutUint64(obj[4:], 0x18800010)
+	binary.LittleEndian.PutUint16(obj[12:], 0xc7)
+	binary.LittleEndian.PutUint32(obj[14:], uint32(len(obj)))
+	binary.LittleEndian.PutUint64(obj[msgFolderAt-itemShift:], 0x187578ae)
+	binary.LittleEndian.PutUint64(obj[itemConvAt:], 0x18800020)
+	var got []c7copy
+	require.NoError(t, scanItems(hxtest.File(hxtest.Block(8, 0x18800010, obj)), func(c c7copy, ok bool) {
+		if ok {
+			got = append(got, c)
+		}
+	}))
+	require.Len(t, got, 1)
+	assert.Equal(t, uint64(0x187578ae), got[0].folder)
+	assert.Equal(t, uint64(0x18800020), got[0].conv)
 }

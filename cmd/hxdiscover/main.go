@@ -21,6 +21,10 @@
 //	hxdiscover framesin|refslots -block offset
 //	hxdiscover entryrefs -value blockkey (0 = all blocks)
 //	HXD_MATCH=text hxdiscover namefind|addrcount   (tree marks matches when HXD_MATCH is set)
+//	hxdiscover sizes
+//	hxdiscover items   [-value itemid] [-marker oc-probe]
+//	hxdiscover bytecand -value probeid
+//	hxdiscover ticks   -value probeid -ticks
 //
 // Real names and addresses are passed only through HXD_MATCH and are never
 // printed.
@@ -272,17 +276,13 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		if err != nil {
 			return err
 		}
-		cmd = func(data []byte) error { return byteCandidates(data, v, 1900, w) }
+		cmd = func(data []byte) error { return byteCandidates(data, v, bytecandLimit, w) }
 	case "ticks":
 		v, err := parseHex(*valueHex, 64)
 		if err != nil {
 			return err
 		}
-		t, err := parseHex(*typeHex, 16)
-		if err != nil {
-			return err
-		}
-		cmd = func(data []byte) error { return probeTicks(data, v, uint16(t), now, w) }
+		cmd = func(data []byte) error { return probeTicks(data, v, *showTicks, now, w) }
 	case "items":
 		var show uint64
 		if *valueHex != "" {
@@ -292,7 +292,11 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			}
 			show = v
 		}
-		cmd = func(data []byte) error { return itemCheck(data, show, w) }
+		m, err := needMarker(true)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return itemCheck(data, show, m, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":

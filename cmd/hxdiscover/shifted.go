@@ -15,7 +15,7 @@ func shifted(data []byte, w io.Writer) error {
 	folders := map[uint64]bool{}
 	good := map[string]int{}
 	total := 0
-	if _, err := scanMessages(data, func(c c7copy, folderOK bool) {
+	if _, err := scanConversations(data, func(c c7copy, folderOK bool) {
 		total++
 		if folderOK {
 			folders[c.folder] = true
@@ -42,7 +42,7 @@ func shifted(data []byte, w io.Writer) error {
 		}
 		hist[fmt.Sprintf("size=%d delta=%s", len(c.obj), delta)]++
 	}
-	_, _ = fmt.Fprintf(w, "message-form copies=%d known folders=%d copies with non-ID at +1166: ids=%d\n", total, len(folders), len(ids))
+	_, _ = fmt.Fprintf(w, "conversation-form copies=%d known folders=%d copies with non-ID at +1166: ids=%d\n", total, len(folders), len(ids))
 	printCounts(w, "normal copies by size", good)
 	printCounts(w, "non-ID copies by size and delta to a known folder ID", hist)
 	return nil

@@ -20,7 +20,7 @@ func indexCheck(data []byte, show uint64, w io.Writer) error {
 	blocks, aligned, refd := map[int64]bool{}, 0, [2]int{}
 	copies := map[uint64][]c7copy{}
 	other := 0
-	st, err := scanMessages(data, func(c c7copy, folderOK bool) {
+	st, err := scanConversations(data, func(c c7copy, folderOK bool) {
 		if !folderOK {
 			other++
 			return

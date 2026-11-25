@@ -20,7 +20,7 @@ func check(data []byte, w io.Writer) error {
 	}
 	hist := map[string]int{}
 	copies := map[uint64][]c7copy{}
-	if _, err := scanMessages(data, func(c c7copy, folderOK bool) {
+	if _, err := scanConversations(data, func(c c7copy, folderOK bool) {
 		if !folderOK {
 			hist["other layout, no folder ID at +1166 (skipped)"]++
 			return
@@ -31,7 +31,7 @@ func check(data []byte, w io.Writer) error {
 	}); err != nil {
 		return err
 	}
-	printCounts(w, "message-form 0xc7 copies", hist)
+	printCounts(w, "conversation-form 0xc7 copies", hist)
 
 	ids := make([]uint64, 0, len(copies))
 	for id := range copies {
@@ -66,7 +66,7 @@ func check(data []byte, w io.Writer) error {
 		folders[key]++
 	}
 	printCounts(w, "current copy chosen by", rule)
-	_, _ = fmt.Fprintf(w, "current copies: messages=%d unread(bit 0x02 clear)=%d distinct folders=%d\n", len(ids), unread, len(folders))
+	_, _ = fmt.Fprintf(w, "current conversation copies: conversations=%d unread(bit 0x02 clear)=%d distinct folders=%d\n", len(ids), unread, len(folders))
 	printCounts(w, "current copies per folder id", folders)
 
 	st, damage, err := hxstore.Scan(data, "HxStore.hxd", func(hxstore.Block) error { return nil })
