@@ -106,3 +106,44 @@ func File(blocks ...[]byte) []byte {
 	}
 	return f
 }
+
+// Index layout written by FileWithIndex (same as the real store).
+const (
+	IndexA        = 0x1000
+	IndexAreaSize = 65536 * 5
+)
+
+// FileWithIndex returns a store whose header points at two block index
+// areas and whose blocks start on 256-byte boundaries after them. Block i
+// gets a direct index slot when direct[i] is true; the header entry count
+// is the number of such slots.
+func FileWithIndex(blocks [][]byte, direct []bool) []byte {
+	b := IndexA + IndexAreaSize
+	start := b + IndexAreaSize
+	f := make([]byte, start, start+len(blocks)*4096)
+	copy(f, "Nostromo")
+	f[8] = 'i'
+	binary.LittleEndian.PutUint64(f[0x38:], 0x1000)
+	binary.LittleEndian.PutUint64(f[0x58:], IndexA)
+	binary.LittleEndian.PutUint64(f[0x78:], uint64(b))
+	slot := 0
+	used := 0
+	for i, blk := range blocks {
+		for len(f)%256 != 0 {
+			f = append(f, 0)
+		}
+		off := len(f)
+		f = append(f, blk...)
+		if i < len(direct) && direct[i] {
+			for _, area := range []int{IndexA, b} {
+				p := area + 5*slot
+				binary.LittleEndian.PutUint32(f[p:], uint32(off/256))
+				f[p+4] = byte((0x28 + len(blk) + 511) / 512)
+			}
+			slot++
+			used++
+		}
+	}
+	binary.LittleEndian.PutUint32(f[0x68:], uint32(used))
+	return f
+}
