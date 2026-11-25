@@ -1,7 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-# Until the outlookcache command exists (Phase 3), build and run use the
-# discovery tool.
-CMD := hxdiscover
+CMD := outlookcache
 BIN := bin/$(CMD)
 
 .PHONY: setup test lint format build run clean upgrade-deps vulncheck
@@ -29,7 +27,7 @@ format: ## Format the code
 build: ## Build the binary into bin/
 	CGO_ENABLED=0 GOFLAGS=-trimpath go build -ldflags="-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/$(CMD)
 
-run: build ## Build and run, for example: make run ARGS="overview"
+run: build ## Build and run, for example: make run ARGS="folders"
 	./$(BIN) $(ARGS)
 
 clean: ## Remove build output

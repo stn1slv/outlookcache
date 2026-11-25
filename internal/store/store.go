@@ -101,6 +101,7 @@ type Store struct {
 
 	data      []byte
 	bodyBlock map[uint64]int64 // message ID -> block that holds its body record
+	listed    map[uint64]bool  // IDs of the messages in Messages
 }
 
 type objVersion struct {
@@ -153,7 +154,7 @@ func Load(data []byte, file string) (*Store, error) {
 	if !h.Supported() {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedVersion, h.Version)
 	}
-	s := &Store{data: data, bodyBlock: map[uint64]int64{}}
+	s := &Store{data: data, bodyBlock: map[uint64]int64{}, listed: map[uint64]bool{}}
 	ix, err := hxstore.ReadIndex(data)
 	switch {
 	case errors.Is(err, hxstore.ErrIndexLayout):
@@ -345,6 +346,7 @@ func Load(data []byte, file string) (*Store, error) {
 		if m.BodyKind == "" {
 			m.BodyKind = BodyUnparsed // no block keyed by the item ID
 		}
+		s.listed[id] = true
 		if v := binary.LittleEndian.Uint64(o[itemReplyToAt:]); ids.has(v) && v != id {
 			m.ReplyToID = hexID(v)
 		}

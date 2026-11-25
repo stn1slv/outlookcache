@@ -213,14 +213,7 @@ func (s *Store) Body(id string) (BodyRef, error) {
 	if err != nil {
 		return BodyRef{}, fmt.Errorf("%w: %q", ErrUnknownMessage, id)
 	}
-	known := false
-	for i := range s.Messages {
-		if s.Messages[i].ID == id {
-			known = true
-			break
-		}
-	}
-	if !known {
+	if !s.listed[v] {
 		return BodyRef{}, fmt.Errorf("%w: %q", ErrUnknownMessage, id)
 	}
 	block, ok := s.bodyBlock[v]
