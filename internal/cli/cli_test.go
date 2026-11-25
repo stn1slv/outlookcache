@@ -118,6 +118,7 @@ func TestErrors(t *testing.T) {
 		{"negative days", []string{"messages", "--days", "-1", "--store", store}, ErrInvalidFlag},
 		{"negative max content", []string{"read", "18800001", "--max-content", "-1", "--store", store}, ErrInvalidFlag},
 		{"empty search", []string{"search", " ", "--store", store}, service.ErrInvalidArgument},
+		{"zero cache ttl", []string{"mcp", "--cache-ttl", "0s", "--store", store}, ErrInvalidFlag},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

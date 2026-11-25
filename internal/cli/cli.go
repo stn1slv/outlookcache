@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
 
+	"github.com/stn1slv/outlookcache/internal/mcpserver"
 	"github.com/stn1slv/outlookcache/internal/service"
 )
 
@@ -25,6 +27,7 @@ var ErrInvalidFlag = errors.New("invalid flag")
 const (
 	envStore      = "OUTLOOKCACHE_STORE"
 	envMaxContent = "OUTLOOKCACHE_MAX_CONTENT"
+	envCacheTTL   = "OUTLOOKCACHE_CACHE_TTL"
 )
 
 type globals struct {
@@ -84,7 +87,7 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		g.ctx = cmd.Context()
-		if g.envErr != nil && !cmd.Flags().Changed("max-content") {
+		if g.envErr != nil && !cmd.Flags().Changed("max-content") && !cmd.Flags().Changed("cache-ttl") {
 			return g.envErr
 		}
 		return validate(cmd)
@@ -104,6 +107,7 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 		searchCommand(g),
 		readCommand(g),
 		threadCommand(g),
+		mcpCommand(g, version),
 	)
 	return root
 }
@@ -332,6 +336,33 @@ func threadCommand(g *globals) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&quoted, "quoted", false, "keep quoted and forwarded text")
 	cmd.Flags().IntVar(&limit, "limit", 20, limitHelp+" (the newest messages are kept)")
+	return cmd
+}
+
+func mcpCommand(g *globals, version string) *cobra.Command {
+	var ttl time.Duration
+	cmd := &cobra.Command{
+		Use:   "mcp",
+		Short: "Run the read-only MCP server on stdin and stdout",
+		Long: "Run the read-only MCP server on stdin and stdout.\n" +
+			"The store is decoded on the first tool call and kept in memory until the TTL ends or Outlook changes the file.\n" +
+			"With --account, every tool serves only that account.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if ttl <= 0 {
+				return fmt.Errorf("%w: --cache-ttl must be more than 0", ErrInvalidFlag)
+			}
+			path := g.store
+			if path == "" {
+				path = os.Getenv(envStore)
+			}
+			cache := service.NewCache(path, ttl, g.logger())
+			server := mcpserver.New(cache, g.options(), version, g.account)
+			return server.Run(cmd.Context(), &mcp.StdioTransport{})
+		},
+	}
+	defTTL := time.Duration(g.envInt(envCacheTTL, 180)) * time.Second
+	cmd.Flags().DurationVar(&ttl, "cache-ttl", defTTL, "how long a decoded store is reused, for example 3m (env "+envCacheTTL+", in seconds)")
 	return cmd
 }
 
