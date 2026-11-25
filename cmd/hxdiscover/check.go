@@ -13,6 +13,8 @@ type c7copy struct {
 	stamp        uint64
 	status, flag byte
 	folder       uint64
+	block        int64
+	key          uint64
 }
 
 // check splits 0xc7 objects into standalone (framing id == block key) and
@@ -41,6 +43,10 @@ func check(data []byte, w io.Writer) error {
 				hist["parent form (skipped)"]++
 				continue
 			}
+			if !isID(binary.LittleEndian.Uint64(p[o+1166:])) {
+				hist["other layout, no folder ID at +1166 (skipped)"]++
+				continue
+			}
 			const form = "message"
 			s := p[o+1772]
 			f := p[o+1742]
@@ -49,7 +55,7 @@ func check(data []byte, w io.Writer) error {
 			var sb [8]byte
 			copy(sb[:6], p[o+370:])
 			folder := binary.LittleEndian.Uint64(p[o+1166:])
-			copies[id] = append(copies[id], c7copy{binary.LittleEndian.Uint64(sb[:]), s, f, folder})
+			copies[id] = append(copies[id], c7copy{binary.LittleEndian.Uint64(sb[:]), s, f, folder, b.Offset, b.Key})
 		}
 	})
 	if err != nil {
@@ -59,7 +65,8 @@ func check(data []byte, w io.Writer) error {
 	ids, conflicts, stamps := 0, 0, map[uint64]bool{}
 	diffKinds := map[string]int{}
 	zeroStamp := 0
-	for _, cs := range copies {
+	shown := 0
+	for id, cs := range copies {
 		ids++
 		top := cs[0]
 		for _, c := range cs {
@@ -85,6 +92,12 @@ func check(data []byte, w io.Writer) error {
 					what += " folder"
 				}
 				diffKinds[what]++
+				if shown < 3 {
+					shown++
+					for _, x := range cs {
+						_, _ = fmt.Fprintf(w, "conflict id=%x block@%d key=%x stamp=%x status=%02x folder=%x\n", id, x.block, x.key, x.stamp, x.status, x.folder)
+					}
+				}
 				break
 			}
 		}

@@ -12,8 +12,14 @@
 //	hxdiscover records -marker oc-probe... -probes rel:len,...
 //	hxdiscover values  -values n,n [-marker oc-probe...]
 //	hxdiscover ids|frames -marker oc-probe...
-//	hxdiscover byid|around -value hex
+//	hxdiscover byid|around -value hex [-key blockkey]
 //	hxdiscover obj     -value hex -type hex
+//	hxdiscover fieldcmp|idslots -type hex [-value hex]
+//	hxdiscover index|shifted
+//	hxdiscover refs    -values offset,offset
+//	hxdiscover slots   -values folder:owner,folder:owner
+//	hxdiscover framesin|refslots -block offset
+//	hxdiscover head    -block offset [-after n]
 package main
 
 import (
@@ -161,6 +167,12 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			return err
 		}
 		cmd = func(data []byte) error { return dumpObject(data, probeRedactor, v, uint16(t), w) }
+	case "fieldcmp":
+		t, err := parseHex(*typeHex, 16)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return fieldCompare(data, uint16(t), w) }
 	case "byid", "around":
 		v, err := parseHex(*valueHex, 64)
 		if err != nil {
@@ -169,8 +181,56 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		if args[0] == "byid" {
 			cmd = func(data []byte) error { return framesByID(data, v, w) }
 		} else {
-			cmd = func(data []byte) error { return around(data, probeRedactor, v, *before, *after, *maxHits, w) }
+			cmd = func(data []byte) error {
+				return around(data, probeRedactor, v, *blockKey, *before, *after, *maxHits, w)
+			}
 		}
+	case "shifted":
+		cmd = func(data []byte) error { return shifted(data, w) }
+	case "refs":
+		cmd = func(data []byte) error { return blockRefs(data, *valueList, w) }
+	case "index":
+		var show uint64
+		if *valueHex != "" {
+			v, err := parseHex(*valueHex, 64)
+			if err != nil {
+				return err
+			}
+			show = v
+		}
+		cmd = func(data []byte) error { return indexCheck(data, show, w) }
+	case "slots":
+		cmd = func(data []byte) error { return slots(data, *valueList, w) }
+	case "idslots":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		t, err := parseHex(*typeHex, 16)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return idSlots(data, v, uint16(t), w) }
+	case "framesin":
+		cmd = func(data []byte) error { return framesIn(data, *blockOff, w) }
+	case "head":
+		cmd = func(data []byte) error { return payloadHead(data, probeRedactor, *blockOff, *after, w) }
+	case "refslots":
+		cmd = func(data []byte) error { return refSlots(data, *blockOff, w) }
+	case "entryrefs":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return entryRefs(data, v, w) }
+	case "namefind":
+		if *marker == "" {
+			return errors.New("namefind needs -marker with a known folder name")
+		}
+		name := *marker
+		cmd = func(data []byte) error { return nameFind(data, name, w) }
+	case "tree":
+		cmd = func(data []byte) error { return folderTree(data, probeRedactor, *marker, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":
