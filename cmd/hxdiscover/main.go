@@ -27,6 +27,12 @@
 //	hxdiscover ticks   -value probeid -ticks
 //	hxdiscover fields|lens|lentable|subjgap|text|recips|attach|storecheck
 //	hxdiscover probelens -value probeid
+//	hxdiscover bodies [-max 5]
+//	hxdiscover bodyshape
+//	hxdiscover bodymap -block offset
+//	hxdiscover bodyprobe
+//	hxdiscover bodyrule
+//	hxdiscover efmcheck [-store path] (reads EFMData files next to the store, read-only)
 //
 // Real names and addresses are passed only through HXD_MATCH and are never
 // printed.
@@ -319,8 +325,23 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		cmd = func(data []byte) error { return recipientCheck(data, w) }
 	case "attach":
 		cmd = func(data []byte) error { return attachmentCheck(data, w) }
+	case "bodymap":
+		if err := needBlock(); err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return bodyMap(data, *blockOff, w) }
+	case "efmcheck":
+		cmd = func(data []byte) error { return efmCheck(data, filepath.Dir(*store), w) }
+	case "bodyrule":
+		cmd = func(data []byte) error { return bodyRule(data, w) }
+	case "bodyprobe":
+		cmd = func(data []byte) error { return bodyProbe(data, w) }
+	case "bodyshape":
+		cmd = func(data []byte) error { return bodyShape(data, w) }
+	case "bodies":
+		cmd = func(data []byte) error { return bodyFind(data, *maxHits, w) }
 	case "storecheck":
-		cmd = func(data []byte) error { return storeCheck(data, w) }
+		cmd = func(data []byte) error { return storeCheck(data, filepath.Dir(*store), w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":

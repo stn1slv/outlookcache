@@ -14,6 +14,10 @@ import (
 // because every record offset was verified on that version only.
 var ErrUnsupportedVersion = errors.New("unsupported HxStore version")
 
+// ErrUnknownMessage is returned for a message ID that the store does not
+// list.
+var ErrUnknownMessage = errors.New("unknown message")
+
 // Account is a mail account found in the store.
 type Account struct {
 	ID      string            `json:"id"`
@@ -52,6 +56,9 @@ type Message struct {
 	Preview        string       `json:"preview,omitempty"`
 	MessageID      string       `json:"message_id,omitempty"`
 	ItemClass      string       `json:"item_class,omitempty"`
+	// BodyKind says where the body is stored: inline, efmdata, none or
+	// unparsed (see Store.Body).
+	BodyKind string `json:"body_kind"`
 	// Confirmed is true when the chosen copy is in a direct slot of the
 	// block index. An unconfirmed message is usually live (its index entry
 	// sits in an overflow bucket) but may be deleted.
@@ -83,12 +90,16 @@ type Stats struct {
 	IndexAreasDiffer int `json:"index_areas_differ"`
 }
 
-// Store is the decoded content of one HxStore.hxd snapshot.
+// Store is the decoded content of one HxStore.hxd snapshot. It keeps the
+// snapshot bytes to read bodies on demand.
 type Store struct {
 	Accounts []Account
 	Folders  []Folder
 	Messages []Message
 	Stats    Stats
+
+	data      []byte
+	itemBlock map[uint64]int64 // message ID -> block of the chosen copy
 }
 
 type objVersion struct {
@@ -141,7 +152,7 @@ func Load(data []byte, file string) (*Store, error) {
 	if !h.Supported() {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedVersion, h.Version)
 	}
-	s := &Store{}
+	s := &Store{data: data, itemBlock: map[uint64]int64{}}
 	ix, err := hxstore.ReadIndex(data)
 	switch {
 	case errors.Is(err, hxstore.ErrIndexLayout):
@@ -268,11 +279,23 @@ func Load(data []byte, file string) (*Store, error) {
 
 	// Pass 2: decode only the blocks that hold chosen objects and keep only
 	// those objects.
+	itemsIn := map[int64][]uint64{} // block -> items whose chosen copy it holds
+	for id, p := range picks {
+		itemsIn[p.block] = append(itemsIn[p.block], id)
+	}
+	bodyKind := make(map[uint64]string, len(picks))
 	frames := map[int64]map[int][]byte{}
 	for block, offs := range need {
 		b, err := hxstore.DecodeAt(data, block)
 		if err != nil {
 			return nil, err
+		}
+		for _, id := range itemsIn[block] {
+			kind := BodyUnparsed
+			if b.Key == id { // the body record is in the item's own block
+				kind = ParseBody(b.Payload).Kind
+			}
+			bodyKind[id] = kind
 		}
 		m := map[int][]byte{}
 		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) {
@@ -303,8 +326,9 @@ func Load(data []byte, file string) (*Store, error) {
 			ID: hexID(id), ConversationID: hexID(conv), FolderID: hexID(p.folder), AccountID: hexID(folderAccount[p.folder]),
 			Subject: text.Subject, Preview: text.Preview, MessageID: text.MessageID, ItemClass: text.Class,
 			Read: p.status&0x02 != 0, HasAttachments: o[itemAttachAt]&0x40 != 0,
-			Confirmed: p.confirmed, Ambiguous: p.ambiguous,
+			Confirmed: p.confirmed, Ambiguous: p.ambiguous, BodyKind: bodyKind[id],
 		}
+		s.itemBlock[id] = p.block
 		if v := binary.LittleEndian.Uint64(o[itemReplyToAt:]); ids.has(v) && v != id {
 			m.ReplyToID = hexID(v)
 		}
