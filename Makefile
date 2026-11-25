@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CMD := outlookcache
 BIN := bin/$(CMD)
 
-.PHONY: setup test lint format build run clean upgrade-deps vulncheck nonet
+.PHONY: setup test lint format build run clean upgrade-deps vulncheck nonet notices
 
 setup: ## Download dependencies and tools
 	go mod download
@@ -16,13 +16,16 @@ test: ## Run the unit tests
 
 lint: ## Run the linters and check formatting
 	go tool golangci-lint run ./...
-	@test -z "$$(go tool gofumpt -extra -l .)" || (echo "Run 'make format' for:"; go tool gofumpt -extra -l .; exit 1)
+	@out="$$(go tool gofumpt -extra -l .)" && if [ -n "$$out" ]; then echo "Run 'make format' for:"; echo "$$out"; exit 1; fi
 
 vulncheck: ## Check for known vulnerabilities
 	go tool govulncheck ./...
 
 nonet: ## Check that no package of this project imports network code
 	./scripts/check-no-network.sh
+
+notices: ## Write the licenses of the linked modules into THIRD_PARTY_NOTICES.md
+	./scripts/third-party-notices.sh
 
 format: ## Format the code
 	go tool gofumpt -extra -w .

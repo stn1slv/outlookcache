@@ -54,11 +54,16 @@ jobs:
       - name: No network code
         run: make nonet
 
+      # The release archive ships THIRD_PARTY_NOTICES.md, so it must list
+      # the licenses of the modules that are linked into the binary now.
+      - name: Third-party notices are current
+        run: make notices && git diff --exit-code THIRD_PARTY_NOTICES.md
+
       - name: GoReleaser config
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
-          version: '~> v2.19'
+          version: '~> v2'
           args: check
 
       - name: govulncheck

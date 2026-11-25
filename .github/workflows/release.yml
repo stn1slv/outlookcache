@@ -40,8 +40,9 @@ jobs:
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
-          # 2.19 or later: the cask uses declarative install steps
-          version: '~> v2.19'
+          # The newest v2. The cask needs 2.19 or later (declarative install
+          # steps), so do not pin an older version.
+          version: '~> v2'
           args: release --clean
         env:
           # Used to create the GitHub Release on outlookcache
