@@ -315,6 +315,8 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		cmd = func(data []byte) error { return textCheck(data, w) }
 	case "recips":
 		cmd = func(data []byte) error { return recipientCheck(data, w) }
+	case "attach":
+		cmd = func(data []byte) error { return attachmentCheck(data, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":

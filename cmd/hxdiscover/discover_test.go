@@ -277,3 +277,17 @@ func TestParseRecipients(t *testing.T) {
 	got := parseRecipients(obj)
 	assert.Equal(t, []recipient{{"alice@example.com", "Alice Example"}, {"bob@example.com", "Bob Other"}}, got)
 }
+
+func TestAttachmentName(t *testing.T) {
+	t.Parallel()
+	obj := bytes.Join([][]byte{
+		encodeU16("alice@example.com"),
+		{0, 0}, // not a file name
+		{0x0e, 0x7c, 0x01, 0x12, 0x00},
+		encodeU16("report.pdf"),
+		{0, 0},
+	}, nil)
+	name, ok := attachmentName(obj)
+	require.True(t, ok)
+	assert.Equal(t, "report.pdf", name)
+}
