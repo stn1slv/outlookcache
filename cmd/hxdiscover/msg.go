@@ -83,20 +83,25 @@ func scanConversations(data []byte, fn func(c c7copy, folderOK bool)) (hxstore.S
 
 // Header fields seen in every store so far (UNVERIFIED meaning): u64 at
 // 0x58 and 0x78 point to two areas of equal size that both hold
-// offset/256 values of blocks.
+// slot tables of block offsets.
 const (
 	hdrAreaA = 0x58
 	hdrAreaB = 0x78
 )
 
-// liveIndex is the candidate live-block test: a block is "indexed" when
-// offset/256 appears as a u32 at any byte position of an area. The entry
-// layout is not decoded, so this is a membership test with a measured
-// false-positive rate of about 0.3%, not a parsed index.
+// liveIndex holds the block index: each area is a table of 65,536 slots of
+// 5 bytes (0x50000 bytes). A used slot holds offset/256 of a block as a
+// u32 in its first 4 bytes; the 5th byte is unknown. How a key maps to a
+// slot is not known (UNVERIFIED layout, see docs/STORAGE.md).
 type liveIndex struct {
 	start, size int
 	areas       [2]map[uint32]bool
 }
+
+const (
+	indexSlots    = 65536
+	indexSlotSize = 5
+)
 
 func readLiveIndex(data []byte) (liveIndex, error) {
 	if len(data) < 0x80 {
@@ -105,21 +110,23 @@ func readLiveIndex(data []byte) (liveIndex, error) {
 	a := binary.LittleEndian.Uint64(data[hdrAreaA:])
 	b := binary.LittleEndian.Uint64(data[hdrAreaB:])
 	n := uint64(len(data))
-	if a == 0 || b <= a || b >= n || b-a > n-b {
+	const size = indexSlots * indexSlotSize
+	if a == 0 || b <= a || b-a != size || b >= n || size > n-b {
 		return liveIndex{}, fmt.Errorf("unexpected area offsets %#x %#x for %d bytes", a, b, n)
 	}
-	size := int(b - a)
 	li := liveIndex{start: int(a), size: size}
-	li.areas[0] = refSet(data, int(a), int(a)+size)
-	li.areas[1] = refSet(data, int(b), int(b)+size)
+	li.areas[0] = slotSet(data[a : a+size])
+	li.areas[1] = slotSet(data[b : b+size])
 	return li, nil
 }
 
-// refSet holds every u32 value found at any byte position in data[lo:hi].
-func refSet(data []byte, lo, hi int) map[uint32]bool {
+// slotSet returns the block offsets/256 held by the used slots of one area.
+func slotSet(area []byte) map[uint32]bool {
 	s := map[uint32]bool{}
-	for i := lo; i+4 <= hi; i++ {
-		s[binary.LittleEndian.Uint32(data[i:])] = true
+	for i := 0; i+indexSlotSize <= len(area); i += indexSlotSize {
+		if v := binary.LittleEndian.Uint32(area[i:]); v != 0 {
+			s[v] = true
+		}
 	}
 	return s
 }

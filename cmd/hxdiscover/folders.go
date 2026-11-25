@@ -145,24 +145,22 @@ func folderList(data []byte, r redactor, w io.Writer) error {
 	return nil
 }
 
-// framesByID counts framings whose ID equals id, by type and size.
+// framesByID lists framings whose ID equals id: type, size, block key,
+// block offset and whether the block is in index area A or B.
 func framesByID(data []byte, id uint64, w io.Writer) error {
+	li, err := readLiveIndex(data)
+	if err != nil {
+		return err
+	}
 	counts := map[string]int{}
-	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		p := b.Payload
-		for off := 0; ; {
-			k := bytes.Index(p[off:], objMagic)
-			if k < 0 || off+k+18 > len(p) {
-				return nil
+	_, _, err = hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
+		forEachFraming(b.Payload, func(_ int, fid uint64, typ uint16, obj []byte) {
+			if fid == id {
+				counts[fmt.Sprintf("type=0x%04x size=%d blockkey=%x block@%d indexedA=%t indexedB=%t", typ, len(obj), b.Key, b.Offset,
+					li.indexed(b.Offset, 0), li.indexed(b.Offset, 1))]++
 			}
-			o := off + k
-			off = o + 4
-			if binary.LittleEndian.Uint64(p[o+4:]) != id {
-				continue
-			}
-			counts[fmt.Sprintf("type=0x%04x size=%d blockkey=%x", binary.LittleEndian.Uint16(p[o+12:]),
-				binary.LittleEndian.Uint32(p[o+14:]), b.Key)]++
-		}
+		})
+		return nil
 	})
 	printCounts(w, "framings with this id", counts)
 	return err

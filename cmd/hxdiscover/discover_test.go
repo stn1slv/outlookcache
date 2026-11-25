@@ -105,21 +105,24 @@ func TestFindNameOneByteAtEnd(t *testing.T) {
 
 func TestReadLiveIndexRejectsBadHeader(t *testing.T) {
 	t.Parallel()
-	data := make([]byte, 0x400)
+	const size = indexSlots * indexSlotSize
+	data := make([]byte, 0x100+2*size+0x100)
 	binary.LittleEndian.PutUint64(data[hdrAreaA:], 0x100)
-	for _, b := range []uint64{0, 0x80, 0x100, 0x3ff, 1 << 62, ^uint64(0)} {
+	for _, b := range []uint64{0, 0x80, 0x100, 0x200, 0x100 + size - 1, 1 << 62, ^uint64(0)} {
 		binary.LittleEndian.PutUint64(data[hdrAreaB:], b)
 		require.NotPanics(t, func() {
 			_, err := readLiveIndex(data)
 			assert.Error(t, err, "b=%#x", b)
 		})
 	}
-	binary.LittleEndian.PutUint64(data[hdrAreaB:], 0x200)
-	binary.LittleEndian.PutUint32(data[0x123:], 0x30) // block at 0x3000, any alignment
+	binary.LittleEndian.PutUint64(data[hdrAreaB:], 0x100+size)
+	binary.LittleEndian.PutUint32(data[0x100+5*7:], 0x30)   // slot 7 -> block at 0x3000
+	binary.LittleEndian.PutUint32(data[0x100+5*8+1:], 0x40) // not on a slot boundary
 	li, err := readLiveIndex(data)
 	require.NoError(t, err)
 	assert.True(t, li.indexed(0x3000, 0))
 	assert.False(t, li.indexed(0x3000, 1))
+	assert.False(t, li.indexed(0x4000, 0), "value not at a slot start")
 	assert.False(t, li.indexed(0x3010, 0), "not on a 256-byte boundary")
 }
 
