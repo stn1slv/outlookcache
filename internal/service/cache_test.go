@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,4 +47,34 @@ func TestCacheReloads(t *testing.T) {
 
 	_, err = NewCache(filepath.Join(dir, "missing.hxd"), time.Minute, nil).Snapshot(ctx)
 	require.ErrorIs(t, err, ErrStoreMissing)
+}
+
+func TestCacheLoadsOnceForConcurrentCalls(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, hxtest.WriteSample(dir, now))
+	c := NewCache(filepath.Join(dir, "HxStore.hxd"), time.Minute, nil)
+
+	const n = 8
+	snaps := make([]*Snapshot, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { snaps[i], errs[i] = c.Snapshot(context.Background()) })
+	}
+	wg.Wait()
+	for i := range n {
+		require.NoError(t, errs[i])
+		assert.Same(t, snaps[0], snaps[i], "one load serves every waiting call")
+	}
+}
+
+func TestCacheWaitEndsWithTheContext(t *testing.T) {
+	t.Parallel()
+	c := NewCache(filepath.Join(t.TempDir(), "HxStore.hxd"), time.Minute, nil)
+	c.gate <- struct{}{} // a load is running
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := c.Snapshot(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }

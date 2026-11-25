@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,8 +27,14 @@ func sampleStore(t *testing.T) string {
 
 func runCLI(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runCLIWithInput(t, "", args...)
+}
+
+func runCLIWithInput(t *testing.T, stdin string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
 	root := NewRootCommand("test", &out, &errOut)
+	root.SetIn(strings.NewReader(stdin))
 	root.SetArgs(args)
 	err = root.ExecuteContext(context.Background())
 	return out.String(), errOut.String(), err
@@ -148,5 +156,94 @@ func TestEnvironment(t *testing.T) {
 		assert.Contains(t, err.Error(), envMaxContent, "the error names the variable")
 		_, _, err = runCLI(t, "accounts", "--max-content", "10")
 		require.NoError(t, err, "the flag overrides a bad variable")
+	}
+}
+
+func TestEnvironmentErrorsApplyOnlyToTheirFlag(t *testing.T) {
+	store := sampleStore(t)
+	t.Setenv(envStore, store)
+
+	t.Setenv(envCacheTTL, "abc")
+	_, _, err := runCLI(t, "accounts")
+	require.NoError(t, err, "commands without --cache-ttl ignore its variable")
+	_, _, err = runCLI(t, "mcp")
+	require.ErrorIs(t, err, ErrInvalidFlag)
+	assert.Contains(t, err.Error(), envCacheTTL)
+	_, _, err = runCLI(t, "mcp", "--max-content", "10")
+	require.ErrorIs(t, err, ErrInvalidFlag, "--max-content does not hide a bad TTL variable")
+	_, _, err = runCLI(t, "mcp", "--cache-ttl", "1m")
+	require.NoError(t, err, "the flag overrides its variable")
+
+	for _, bad := range []string{"0", "-5", "99999999999"} {
+		t.Setenv(envCacheTTL, bad)
+		_, _, err = runCLI(t, "mcp")
+		require.ErrorIs(t, err, ErrInvalidFlag, bad)
+		assert.Contains(t, err.Error(), envCacheTTL, "the error names the variable")
+	}
+
+	t.Setenv(envCacheTTL, "60")
+	t.Setenv(envMaxContent, "abc")
+	_, _, err = runCLI(t, "mcp", "--cache-ttl", "1m")
+	require.ErrorIs(t, err, ErrInvalidFlag, "--cache-ttl does not hide a bad max content variable")
+	assert.Contains(t, err.Error(), envMaxContent)
+}
+
+func TestMCPCommand(t *testing.T) {
+	t.Parallel()
+	store := sampleStore(t)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	var errOut bytes.Buffer
+	root := NewRootCommand("test", outW, &errOut)
+	root.SetIn(inR)
+	root.SetArgs([]string{"mcp", "--store", store})
+	done := make(chan error, 1)
+	go func() {
+		done <- root.ExecuteContext(context.Background())
+		_ = outW.Close()
+	}()
+
+	lines := bufio.NewScanner(outR)
+	exchange := func(requests ...string) string {
+		t.Helper()
+		for _, r := range requests {
+			_, err := io.WriteString(inW, r+"\n")
+			require.NoError(t, err)
+		}
+		require.True(t, lines.Scan(), "a reply")
+		var frame map[string]any
+		require.NoError(t, json.Unmarshal(lines.Bytes(), &frame), "stdout holds only protocol frames")
+		assert.Equal(t, "2.0", frame["jsonrpc"])
+		return lines.Text()
+	}
+	exchange(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	reply := exchange(`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_accounts","arguments":{}}}`)
+	assert.Contains(t, reply, "bob@example.com")
+
+	require.NoError(t, inW.Close())
+	assert.False(t, lines.Scan(), "nothing more on stdout")
+	require.NoError(t, <-done, "the server stops cleanly at the end of input")
+	assert.Empty(t, errOut.String())
+}
+
+func TestMCPCommandStopsCleanlyOnCancel(t *testing.T) {
+	t.Parallel()
+	store := sampleStore(t)
+	r, w := io.Pipe()
+	defer func() { _ = w.Close() }()
+	var out, errOut bytes.Buffer
+	root := NewRootCommand("test", &out, &errOut)
+	root.SetIn(r)
+	root.SetArgs([]string{"mcp", "--store", store})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- root.ExecuteContext(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "a stop signal is not an error")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server did not stop")
 	}
 }

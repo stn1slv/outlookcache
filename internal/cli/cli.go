@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -30,8 +31,15 @@ const (
 	envCacheTTL   = "OUTLOOKCACHE_CACHE_TTL"
 )
 
+// envError is a malformed environment variable. It is reported only by
+// commands that have its flag, and only when that flag is not set.
+type envError struct {
+	flag string
+	err  error
+}
+
 type globals struct {
-	envErr     error // a malformed environment variable
+	envErrs    []envError
 	store      string
 	account    string
 	maxContent int
@@ -53,20 +61,33 @@ func (g *globals) options() service.Options {
 	return service.Options{MaxContent: g.maxContent, Now: time.Now}
 }
 
-// envInt reads a whole number 0 or more from the environment variable
-// name; an unset variable gives def. A malformed value is kept in
-// g.envErr and reported before the command runs.
-func (g *globals) envInt(name string, def int) int {
+// envInt reads a whole number from min to max from the environment
+// variable name, the default of flag; an unset variable gives def. A
+// malformed value is kept and reported before a command with that flag
+// runs, unless the flag is set.
+func (g *globals) envInt(name, flag string, def, minV, maxV int) int {
 	raw, set := os.LookupEnv(name)
 	if !set || strings.TrimSpace(raw) == "" {
 		return def
 	}
 	v, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil || v < 0 {
-		g.envErr = fmt.Errorf("%w: %s must be a whole number 0 or more", ErrInvalidFlag, name)
+	if err != nil || v < minV || v > maxV {
+		g.envErrs = append(g.envErrs, envError{flag, fmt.Errorf("%w: %s must be a whole number from %d to %d", ErrInvalidFlag, name, minV, maxV)})
 		return def
 	}
 	return v
+}
+
+// checkEnv returns the errors of the environment variables that apply to
+// cmd.
+func (g *globals) checkEnv(cmd *cobra.Command) error {
+	var errs []error
+	for _, e := range g.envErrs {
+		if cmd.Flags().Lookup(e.flag) != nil && !cmd.Flags().Changed(e.flag) {
+			errs = append(errs, e.err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // NewRootCommand returns the outlookcache command with its subcommands.
@@ -87,8 +108,8 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		g.ctx = cmd.Context()
-		if g.envErr != nil && !cmd.Flags().Changed("max-content") && !cmd.Flags().Changed("cache-ttl") {
-			return g.envErr
+		if err := g.checkEnv(cmd); err != nil {
+			return err
 		}
 		return validate(cmd)
 	}
@@ -97,7 +118,7 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 	flags := root.PersistentFlags()
 	flags.StringVar(&g.store, "store", "", "path to HxStore.hxd (default: env "+envStore+", else the default profile)")
 	flags.StringVar(&g.account, "account", "", "only this account, by ID or e-mail address (see the accounts command)")
-	flags.IntVar(&g.maxContent, "max-content", g.envInt(envMaxContent, 4000), "characters of body text in read and thread, 0 for no limit (env "+envMaxContent+")")
+	flags.IntVar(&g.maxContent, "max-content", g.envInt(envMaxContent, "max-content", 4000, 0, math.MaxInt), "characters of body text in read and thread, 0 for no limit (env "+envMaxContent+")")
 	flags.BoolVarP(&g.verbose, "verbose", "v", false, "log load statistics to stderr")
 
 	root.AddCommand(
@@ -169,12 +190,16 @@ func writeJSON(g *globals, snap *service.Snapshot, sum summary, out any) error {
 	return nil
 }
 
-func (g *globals) load() (*service.Snapshot, error) {
-	path := g.store
-	if path == "" {
-		path = os.Getenv(envStore)
+// storePath is --store, else the environment, else "" for the default.
+func (g *globals) storePath() string {
+	if g.store != "" {
+		return g.store
 	}
-	return service.Load(g.ctx, path, g.logger())
+	return os.Getenv(envStore)
+}
+
+func (g *globals) load() (*service.Snapshot, error) {
+	return service.Load(g.ctx, g.storePath(), g.logger())
 }
 
 func listSummary(l service.List) summary {
@@ -345,26 +370,38 @@ func mcpCommand(g *globals, version string) *cobra.Command {
 		Use:   "mcp",
 		Short: "Run the read-only MCP server on stdin and stdout",
 		Long: "Run the read-only MCP server on stdin and stdout.\n" +
-			"The store is decoded on the first tool call and kept in memory until the TTL ends or Outlook changes the file.\n" +
+			"The store is decoded on the first tool call. Later calls reuse it until the TTL ends or Outlook changes the file.\n" +
 			"With --account, every tool serves only that account.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if ttl <= 0 {
 				return fmt.Errorf("%w: --cache-ttl must be more than 0", ErrInvalidFlag)
 			}
-			path := g.store
-			if path == "" {
-				path = os.Getenv(envStore)
-			}
-			cache := service.NewCache(path, ttl, g.logger())
+			cache := service.NewCache(g.storePath(), ttl, g.logger())
 			server := mcpserver.New(cache, g.options(), version, g.account)
-			return server.Run(cmd.Context(), &mcp.StdioTransport{})
+			transport := &mcp.IOTransport{Reader: io.NopCloser(cmd.InOrStdin()), Writer: nopWriteCloser{g.stdout}}
+			return stopIsClean(cmd.Context(), server.Run(cmd.Context(), transport))
 		},
 	}
-	defTTL := time.Duration(g.envInt(envCacheTTL, 180)) * time.Second
+	defTTL := time.Duration(g.envInt(envCacheTTL, "cache-ttl", 180, 1, maxTTLSeconds)) * time.Second
 	cmd.Flags().DurationVar(&ttl, "cache-ttl", defTTL, "how long a decoded store is reused, for example 3m (env "+envCacheTTL+", in seconds)")
 	return cmd
 }
+
+// maxTTLSeconds is the largest OUTLOOKCACHE_CACHE_TTL, one year.
+const maxTTLSeconds = 365 * 24 * 60 * 60
+
+// stopIsClean drops the error of a server stopped by SIGINT or SIGTERM.
+func stopIsClean(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		return nil //nolint:nilerr // a stop signal is a clean exit, not an error
+	}
+	return err
+}
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
 
 // Execute runs the command line and returns the exit code.
 func Execute(ctx context.Context, version string, args []string) int {

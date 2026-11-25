@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,8 +13,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stn1slv/outlookcache/internal/hxstore"
 	"github.com/stn1slv/outlookcache/internal/hxtest"
 	"github.com/stn1slv/outlookcache/internal/service"
+	"github.com/stn1slv/outlookcache/internal/store"
 )
 
 func connect(t *testing.T, account string, mutate func(dir string)) *mcp.ClientSession {
@@ -119,7 +122,7 @@ func TestTools(t *testing.T) {
 	require.Len(t, out.Result, 1)
 	assert.Equal(t, 1, out.Unconfirmed)
 
-	out = call(t, session, "read_message", map[string]any{"message_id": "18800001"})
+	out = call(t, session, "read_message", map[string]any{"id": "18800001"})
 	require.Len(t, out.Result, 1)
 	body, ok := out.Result[0]["body"].(map[string]any)
 	require.True(t, ok)
@@ -137,39 +140,93 @@ func TestArgumentErrors(t *testing.T) {
 	session := connect(t, "", nil)
 	for name, args := range map[string]map[string]any{
 		"search_messages": {"query": " "},
-		"read_message":    {"message_id": ""},
+		"read_message":    {"id": ""},
 		"read_thread":     {"conversation_id": ""},
 		"list_messages":   {"limit": -1},
 	} {
 		assert.Contains(t, callError(t, session, name, args), "invalid argument", name)
 	}
-	assert.Contains(t, callError(t, session, "read_message", map[string]any{"message_id": "18800099"}), "not found")
+	assert.Contains(t, callError(t, session, "read_message", map[string]any{"id": "18800099"}), "not found")
 	assert.Contains(t, callError(t, session, "list_messages", map[string]any{"folder": "nope"}), "not found")
 }
 
 func TestBoundAccount(t *testing.T) {
 	t.Parallel()
-	session := connect(t, "bob@example.com", nil)
-	out := call(t, session, "list_messages", nil)
-	assert.Len(t, out.Result, 3)
-	out = call(t, session, "list_messages", map[string]any{"account": "BOB@example.com"})
-	assert.Len(t, out.Result, 3)
-	msg := callError(t, session, "list_messages", map[string]any{"account": "18750099"})
-	assert.Contains(t, msg, "serves only one account")
-	assert.NotContains(t, msg, "bob@example.com", "the error does not name the bound account")
+	for _, bound := range []string{"bob@example.com", "18750001", " BOB@example.com "} {
+		session := connect(t, bound, nil)
+		out := call(t, session, "list_messages", nil)
+		assert.Len(t, out.Result, 3, bound)
+		for _, same := range []string{"BOB@example.com", "18750001", " 18750001 "} {
+			out = call(t, session, "list_messages", map[string]any{"account": same})
+			assert.Len(t, out.Result, 3, "bound %q, called with %q", bound, same)
+		}
+		msg := callError(t, session, "list_messages", map[string]any{"account": "18750099"})
+		assert.Contains(t, msg, "serves only one account")
+		assert.NotContains(t, msg, "bob@example.com", "the error does not name the bound account")
+		assert.NotContains(t, msg, "18750001", "the error does not name the bound account")
+	}
+}
+
+func TestBoundToAMissingAccount(t *testing.T) {
+	t.Parallel()
+	// Every tool must pass the bound account to the service: with an
+	// account that is not in the store, no tool returns any data.
+	session := connect(t, "zed@example.com", nil)
+	for name, args := range map[string]map[string]any{
+		"list_accounts":   nil,
+		"list_folders":    nil,
+		"list_messages":   nil,
+		"search_messages": {"query": "numbers"},
+		"read_message":    {"id": "18800001"},
+		"read_thread":     {"conversation_id": "18800101"},
+	} {
+		msg := callError(t, session, name, args)
+		assert.Contains(t, msg, "not found", name)
+		assert.NotContains(t, msg, "zed@example.com", "%s: the error does not name the bound account", name)
+	}
+}
+
+func TestContentTrustComesFirst(t *testing.T) {
+	t.Parallel()
+	session := connect(t, "", nil)
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "read_message", Arguments: map[string]any{"id": "18800001"}})
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Content)
+	text, ok := res.Content[0].(*mcp.TextContent)
+	require.True(t, ok)
+	assert.True(t, strings.HasPrefix(text.Text, `{"content_trust":`), "a reader sees the trust label before any mail content")
+}
+
+func TestPartialCountsEveryGap(t *testing.T) {
+	t.Parallel()
+	for name, st := range map[string]store.Stats{
+		"skipped records":  {SkippedRecords: 1},
+		"damaged sections": {Damage: []hxstore.Damage{{Offset: 1}}},
+		"unindexed damage": {UnindexedDamaged: 1},
+		"undecoded blocks": {UndecodedBlocks: 1},
+		"index unreadable": {IndexUnreadable: true},
+	} {
+		snap := &service.Snapshot{Store: &store.Store{Stats: st}}
+		r := envelope(snap, []int{})
+		assert.True(t, r.Partial, name)
+	}
+	r := envelope(&service.Snapshot{Store: &store.Store{}}, []int(nil))
+	assert.False(t, r.Partial)
+	assert.NotNil(t, r.Result)
+	assert.NotNil(t, r.DamagedSections)
 }
 
 func TestPartialWhenABodyCannotBeRead(t *testing.T) {
 	t.Parallel()
 	// Without its EFMData file the body of message 2 cannot be read.
 	session := connect(t, "", nil)
-	out := call(t, session, "read_message", map[string]any{"message_id": "18800002"})
+	out := call(t, session, "read_message", map[string]any{"id": "18800002"})
 	assert.False(t, out.Partial)
 
 	missing := connect(t, "", func(dir string) {
 		require.NoError(t, os.RemoveAll(filepath.Join(dir, "Files")))
 	})
-	out = call(t, missing, "read_message", map[string]any{"message_id": "18800002"})
+	out = call(t, missing, "read_message", map[string]any{"id": "18800002"})
 	assert.True(t, out.Partial)
 	assert.Equal(t, 1, out.UnreadableBodies)
 	out = call(t, missing, "search_messages", map[string]any{"query": "friday at", "in_body": true})

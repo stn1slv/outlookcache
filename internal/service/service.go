@@ -222,7 +222,7 @@ func (l List) Unconfirmed() int {
 
 // Accounts returns the accounts, or the one that account names.
 func (s *Snapshot) Accounts(account string) ([]store.Account, error) {
-	id, err := s.accountID(account)
+	id, err := s.AccountID(account)
 	if err != nil {
 		return nil, err
 	}
@@ -235,9 +235,10 @@ func (s *Snapshot) Accounts(account string) ([]store.Account, error) {
 	return out, nil
 }
 
-// accountID resolves an account ID or address; "" stays "". The error
+// AccountID resolves an account ID or address; "" stays "". The error
 // does not repeat the value, so an address is never printed.
-func (s *Snapshot) accountID(account string) (string, error) {
+func (s *Snapshot) AccountID(account string) (string, error) {
+	account = strings.TrimSpace(account)
 	if account == "" {
 		return "", nil
 	}
@@ -247,13 +248,13 @@ func (s *Snapshot) accountID(account string) (string, error) {
 			return a.ID, nil
 		}
 	}
-	return "", fmt.Errorf("%w: no account with this ID or address (see the accounts command)", ErrNotFound)
+	return "", fmt.Errorf("%w: no account with this ID or address (list the accounts to see the valid values)", ErrNotFound)
 }
 
 // Folders returns the folders of all accounts or of one, with message
 // counts.
 func (s *Snapshot) Folders(ctx context.Context, account string) ([]FolderRow, error) {
-	id, err := s.accountID(account)
+	id, err := s.AccountID(account)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +310,7 @@ func (s *Snapshot) folderIDs(folder, accountID string) (map[string]bool, error) 
 			return set, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: no folder with this ID, role or name (see the folders command)", ErrNotFound)
+	return nil, fmt.Errorf("%w: no folder with this ID, role or name (list the folders to see the valid values)", ErrNotFound)
 }
 
 func (s *Snapshot) row(m store.Message) MessageRow {
@@ -351,7 +352,7 @@ func (s *Snapshot) selectMessages(ctx context.Context, f Filter, opts Options, m
 	if err := f.validate(); err != nil {
 		return List{}, err
 	}
-	accountID, err := s.accountID(f.Account)
+	accountID, err := s.AccountID(f.Account)
 	if err != nil {
 		return List{}, err
 	}
@@ -529,7 +530,7 @@ func (s *Snapshot) Message(ctx context.Context, id, account string, quoted bool,
 	if err := opts.validate(); err != nil {
 		return MessageDetail{}, err
 	}
-	accountID, err := s.accountID(account)
+	accountID, err := s.AccountID(account)
 	if err != nil {
 		return MessageDetail{}, err
 	}
