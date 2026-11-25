@@ -29,6 +29,17 @@ const (
 	sampleName     = "Bob Other"
 )
 
+// IDs of the second account written by WriteSampleTwoAccounts. It has no
+// Sent mail, so it has no address.
+const (
+	SampleRoot2    = 0x18760001
+	SampleInbox2   = 0x18760010
+	sampleSent2    = 0x18760020
+	sampleDeleted2 = 0x18760030
+	SampleM4       = 0x18800004 // Inbox of the second account, unread, no stored body
+	SampleConv3    = 0x18800103
+)
+
 // Sample bodies (synthetic).
 const (
 	SampleBody1 = `<html><body><p>The numbers are attached.</p><div id="divRplyFwdMsg"><b>From:</b> Carol</div><p>older text</p></body></html>`
@@ -102,19 +113,16 @@ func folderRecord(parent, id, owner uint64, name string) []byte {
 	}, nil)
 }
 
-func rootPayload() []byte {
+func rootPayload(root, inbox, sent, deleted uint64, dir string, extra ...[]byte) []byte {
 	head := make([]byte, 2048)
-	copy(head[861:], slotRef(SampleInbox, SampleRoot))
-	copy(head[1549:], slotRef(SampleSent, SampleRoot))
-	copy(head[429:], slotRef(SampleDeleted, SampleRoot))
-	return bytes.Join([][]byte{
-		head,
-		folderRecord(SampleRoot, SampleInbox, SampleRoot, "Inbox"),
-		folderRecord(SampleRoot, SampleSent, SampleRoot, "Sent Items"),
-		folderRecord(SampleInbox, SampleProjects, SampleRoot, "Projects"),
-		u16z("/Users/x/Files/S0/" + SampleDir + "/EFMData/1.dat"),
-		Framing(SampleRoot, 0x02e0, 40, nil),
-	}, nil)
+	copy(head[861:], slotRef(inbox, root))
+	copy(head[1549:], slotRef(sent, root))
+	copy(head[429:], slotRef(deleted, root))
+	parts := make([][]byte, 0, 5+len(extra))
+	parts = append(parts, head, folderRecord(root, inbox, root, "Inbox"), folderRecord(root, sent, root, "Sent Items"))
+	parts = append(parts, extra...)
+	parts = append(parts, u16z("/Users/x/Files/S0/"+dir+"/EFMData/1.dat"), Framing(root, 0x02e0, 40, nil))
+	return bytes.Join(parts, nil)
 }
 
 type sampleItem struct {
@@ -186,7 +194,13 @@ func bodyHead(flags uint32, size int, fields ...[]byte) []byte {
 // WriteSample writes a synthetic store to dir/HxStore.hxd and the EFMData
 // file of message M2 to dir/Files/S0/<SampleDir>/EFMData. Message times are
 // relative to now.
-func WriteSample(dir string, now time.Time) error {
+func WriteSample(dir string, now time.Time) error { return writeSample(dir, now, false) }
+
+// WriteSampleTwoAccounts writes the sample store plus a second account
+// (SampleRoot2) with one message, SampleM4.
+func WriteSampleTwoAccounts(dir string, now time.Time) error { return writeSample(dir, now, true) }
+
+func writeSample(dir string, now time.Time, twoAccounts bool) error {
 	efmPath := "/Users/x/Library/Files/S0/" + SampleDir + "/EFMData/" + SampleEFMFile
 	items := []sampleItem{
 		{
@@ -210,7 +224,8 @@ func WriteSample(dir string, now time.Time) error {
 	}
 	blocks := make([][]byte, 0, 7+len(items))
 	blocks = append(blocks,
-		Block(8, SampleRoot, rootPayload()),
+		Block(8, SampleRoot, rootPayload(SampleRoot, SampleInbox, SampleSent, SampleDeleted, SampleDir,
+			folderRecord(SampleInbox, SampleProjects, SampleRoot, "Projects"))),
 		Block(8, SampleInbox, Framing(SampleInbox, 0x1e3, 40, nil)),
 		Block(8, SampleSent, Framing(SampleSent, 0x1e3, 40, nil)),
 		Block(8, SampleDeleted, Framing(SampleDeleted, 0x1e3, 40, nil)),
@@ -218,6 +233,21 @@ func WriteSample(dir string, now time.Time) error {
 		Block(8, SampleConv1, Framing(SampleConv1, 0x2ec, 40, nil)),
 		Block(8, SampleConv2, Framing(SampleConv2, 0x2ec, 40, nil)),
 	)
+	if twoAccounts {
+		blocks = append(blocks,
+			Block(8, SampleRoot2, rootPayload(SampleRoot2, SampleInbox2, sampleSent2, sampleDeleted2, "8")),
+			Block(8, SampleInbox2, Framing(SampleInbox2, 0x1e3, 40, nil)),
+			Block(8, sampleSent2, Framing(sampleSent2, 0x1e3, 40, nil)),
+			Block(8, sampleDeleted2, Framing(sampleDeleted2, 0x1e3, 40, nil)),
+			Block(8, SampleConv3, Framing(SampleConv3, 0x2ec, 40, nil)),
+		)
+		items = append(items, sampleItem{
+			id: SampleM4, conv: SampleConv3, folder: SampleInbox2,
+			from: "dave@example.com", fromName: "Dave Fourth", to: [][2]string{{"erin@example.com", "Erin Fifth"}},
+			subject: "Numbers for the other team", preview: "Other account numbers.", received: now.Add(-2 * time.Hour),
+			head: bodyHead(0, 0),
+		})
+	}
 	direct := make([]bool, len(blocks), len(blocks)+len(items))
 	for i := range direct {
 		direct[i] = true

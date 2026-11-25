@@ -167,6 +167,38 @@ func TestBoundAccount(t *testing.T) {
 	}
 }
 
+func TestBoundServerHidesOtherAccounts(t *testing.T) {
+	t.Parallel()
+	twoAccounts := func(dir string) { require.NoError(t, hxtest.WriteSampleTwoAccounts(dir, time.Now())) }
+	other, otherMsg, otherConv := "18760001", "18800004", "18800103"
+
+	// Without a binding, the second account and its message are visible.
+	open := connect(t, "", twoAccounts)
+	assert.Len(t, call(t, open, "list_accounts", nil).Result, 2)
+	require.Len(t, call(t, open, "read_message", map[string]any{"id": otherMsg}).Result, 1)
+	require.Len(t, call(t, open, "read_thread", map[string]any{"conversation_id": otherConv}).Result, 1)
+	assert.Len(t, call(t, open, "search_messages", map[string]any{"query": "numbers"}).Result, 3)
+
+	bound := connect(t, "bob@example.com", twoAccounts)
+	assert.Len(t, call(t, bound, "list_accounts", nil).Result, 1)
+	for name, args := range map[string]map[string]any{
+		"list_folders":    nil,
+		"list_messages":   {"limit": 0},
+		"search_messages": {"query": "numbers", "limit": 0},
+	} {
+		out := call(t, bound, name, args)
+		require.NotEmpty(t, out.Result, name)
+		for _, row := range out.Result {
+			assert.Equal(t, "18750001", row["account_id"], name)
+		}
+	}
+	assert.Contains(t, callError(t, bound, "read_message", map[string]any{"id": otherMsg}), "not found")
+	assert.Contains(t, callError(t, bound, "read_thread", map[string]any{"conversation_id": otherConv}), "not found")
+	for _, name := range []string{"list_accounts", "list_folders", "list_messages"} {
+		assert.Contains(t, callError(t, bound, name, map[string]any{"account": other}), "serves only one account", name)
+	}
+}
+
 func TestBoundToAMissingAccount(t *testing.T) {
 	t.Parallel()
 	// Every tool must pass the bound account to the service: with an
