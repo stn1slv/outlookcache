@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on version tags, e.g., v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: Release via GoReleaser
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0 # GoReleaser needs the git history and tags
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # A tag can point to a commit that never ran CI, so run the checks
+      # that guard the hard rules again.
+      - name: Lint
+        run: make lint
+
+      - name: No network code
+        run: make nonet
+
+      - name: Run Tests
+        run: make test
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
+        with:
+          distribution: goreleaser
+          # The newest v2. The cask needs 2.19 or later (declarative install
+          # steps), so do not pin an older version.
+          version: '~> v2'
+          args: release --clean
+        env:
+          # Used to create the GitHub Release on outlookcache
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Used to push the cask to stn1slv/homebrew-tap
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
