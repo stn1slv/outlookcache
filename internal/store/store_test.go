@@ -70,7 +70,9 @@ func ticksOf(t time.Time) []byte {
 	return u64(uint64(t.UnixNano()/100) + ticksUnixEpoch)
 }
 
-func itemPayload(sent time.Time) []byte {
+// itemPayload builds an item with To and attachment objects; withConv adds
+// a framing for its conversation ID.
+func itemPayload(sent time.Time, withConv bool) []byte {
 	obj := make([]byte, 1800)
 	copy(obj[itemStampAt:], []byte{9, 0, 0, 0, 0, 0})
 	copy(obj[itemConvAt:], u64(tConv))
@@ -96,13 +98,18 @@ func itemPayload(sent time.Time) []byte {
 	att := make([]byte, 700)
 	copy(att[100:], bytes.Join([][]byte{{0x0e, 0x7c, 0x01, 0x12, 0x00}, encodeU16("report.pdf"), {0, 0}}, nil))
 	binary.LittleEndian.PutUint32(att[attachSizeAt:], 1234)
-	return bytes.Join([][]byte{
+	cc := bytes.Join([][]byte{{0x80, 0, 0x0e, 0x7c, 0x01, 0x12, 0x00}, encodeU16("carol@example.com"), {0, 0}, {0x05, 0, 0, 0}}, nil)
+	parts := [][]byte{
 		framing(tItem, typeMessage, 0, body),
 		framing(tItem, typeTo, 0, to),
+		framing(tItem, typeCc, 0, cc),
 		framing(tItem, typeAttachment, 0, att[18:]),
-		framing(tConv, 0x2ec, 40, nil),
 		framing(tParent, 0x2ec, 40, nil),
-	}, nil)
+	}
+	if withConv {
+		parts = append(parts, framing(tConv, 0x2ec, 40, nil))
+	}
+	return bytes.Join(parts, nil)
 }
 
 func TestLoadSyntheticStore(t *testing.T) {
@@ -112,7 +119,7 @@ func TestLoadSyntheticStore(t *testing.T) {
 		hxtest.Block(8, tRoot, rootPayload()),
 		hxtest.Block(8, tInbox, framing(tInbox, 0x1e3, 40, nil)),
 		hxtest.Block(8, tSent, framing(tSent, 0x1e3, 40, nil)),
-		hxtest.Block(8, tItem, itemPayload(sent)),
+		hxtest.Block(8, tItem, itemPayload(sent, true)),
 	}, []bool{true, true, true, false})
 	s, err := Load(data, "t.hxd")
 	require.NoError(t, err)
@@ -140,6 +147,7 @@ func TestLoadSyntheticStore(t *testing.T) {
 	assert.Equal(t, "Quarterly numbers", m.Subject)
 	assert.Equal(t, &Recipient{Name: "Alice Example", Address: "alice@example.com"}, m.From)
 	assert.Equal(t, []Recipient{{Name: "Bob Other", Address: "bob@example.com"}}, m.To)
+	assert.Equal(t, []Recipient{{Address: "carol@example.com"}}, m.Cc, "binary after the address is not a name")
 	assert.Equal(t, "short preview", m.Preview)
 	assert.Equal(t, "<m1@example.com>", m.MessageID)
 	assert.Equal(t, "IPM.Note", m.ItemClass)
@@ -153,6 +161,81 @@ func TestLoadSyntheticStore(t *testing.T) {
 	assert.False(t, m.Confirmed, "the item block has no direct slot")
 	assert.Equal(t, 1, s.Stats.Unconfirmed)
 	assert.Empty(t, s.Stats.Damage)
+}
+
+// blockAt returns the file offset of the n-th valid block.
+func blockAt(t *testing.T, data []byte, n int) int64 {
+	t.Helper()
+	var offs []int64
+	_, _, err := hxstore.Scan(data, "t", func(b hxstore.Block) error {
+		offs = append(offs, b.Offset)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Greater(t, len(offs), n)
+	return offs[n]
+}
+
+func TestLoadKeepsItemWithoutConversationAndSortsDamage(t *testing.T) {
+	t.Parallel()
+	sent := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	filler := []byte("a block payload that is long enough to compress")
+	data := hxtest.FileWithIndex([][]byte{
+		hxtest.Block(8, tRoot, rootPayload()),
+		hxtest.Block(8, tInbox, framing(tInbox, 0x1e3, 40, nil)),
+		hxtest.Block(8, tItem, itemPayload(sent, false)),
+		hxtest.Block(8, 0x18900001, filler),  // damaged, in a direct slot
+		hxtest.Block(8, 0x18900002, filler),  // damaged, no direct slot
+		hxtest.Block(16, 0x18900003, filler), // damaged type 16
+	}, []bool{true, true, true, true, false, false})
+	for range 3 { // after each change the next valid block becomes block 3
+		data[blockAt(t, data, 3)+0x29] ^= 0xff
+	}
+	s, err := Load(data, "t.hxd")
+	require.NoError(t, err)
+	require.Len(t, s.Messages, 1, "an unknown conversation ID must not drop the item")
+	m := s.Messages[0]
+	assert.Empty(t, m.ConversationID)
+	assert.Equal(t, "Quarterly numbers", m.Subject)
+	assert.True(t, m.Confirmed)
+	assert.Zero(t, s.Stats.Unconfirmed)
+	assert.Zero(t, s.Stats.SkippedRecords)
+	require.Len(t, s.Stats.Damage, 1)
+	assert.Equal(t, 1, s.Stats.UnindexedDamaged)
+	assert.Equal(t, 1, s.Stats.UndecodedBlocks)
+}
+
+func TestLoadCountsItemsWithoutFolder(t *testing.T) {
+	t.Parallel()
+	obj := itemPayload(time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC), true)
+	copy(obj[itemFolderAt:], u64(0x18aaaaaa)) // not an object ID of this store
+	data := hxtest.FileWithIndex([][]byte{
+		hxtest.Block(8, tRoot, rootPayload()),
+		hxtest.Block(8, tItem, obj),
+	}, []bool{true, true})
+	s, err := Load(data, "t.hxd")
+	require.NoError(t, err)
+	assert.Empty(t, s.Messages)
+	assert.Equal(t, 1, s.Stats.SkippedRecords)
+}
+
+func TestLoadWithoutUsableIndex(t *testing.T) {
+	t.Parallel()
+	data := hxtest.FileWithIndex([][]byte{hxtest.Block(8, tRoot, rootPayload())}, []bool{true})
+	binary.LittleEndian.PutUint64(data[0x78:], 0) // area B offset broken
+	s, err := Load(data, "t.hxd")
+	require.NoError(t, err)
+	assert.True(t, s.Stats.IndexUnreadable)
+	require.Len(t, s.Accounts, 1)
+}
+
+func TestVersionBlock(t *testing.T) {
+	t.Parallel()
+	vs := []objVersion{{block: 100, direct: true}, {block: 200}, {block: 300}, {block: 200, frame: 9}}
+	assert.Equal(t, int64(200), versionBlock(vs, 200), "the chosen item's block wins")
+	assert.Equal(t, int64(100), versionBlock(vs, 999), "then a direct block")
+	assert.Equal(t, int64(200), versionBlock(vs[1:], 999), "then the last block")
+	assert.Len(t, inBlock(vs, 200), 2)
 }
 
 func TestLoadRejectsOtherVersion(t *testing.T) {
@@ -180,6 +263,16 @@ func TestPickCurrent(t *testing.T) {
 
 	_, _, ambiguous = pickCurrent([]itemCopy{{stamp: 4, status: 0x80}, {stamp: 4, status: 0x82}})
 	assert.True(t, ambiguous)
+
+	// Several tied direct copies: a direct copy is returned, and only the
+	// direct copies decide ambiguity.
+	other := itemCopy{stamp: 5, status: 0x80, block: 1}
+	d1 := itemCopy{stamp: 5, status: 0x82, block: 2, direct: true}
+	d2 := itemCopy{stamp: 5, status: 0x82, block: 3, direct: true}
+	c, confirmed, ambiguous = pickCurrent([]itemCopy{other, d1, d2})
+	assert.Equal(t, d1, c)
+	assert.True(t, confirmed)
+	assert.False(t, ambiguous)
 }
 
 func TestReadRecipientsDedupes(t *testing.T) {
@@ -198,7 +291,7 @@ func TestReadRecipientsDedupes(t *testing.T) {
 		{0, 0},
 		{0, 0},
 	}, nil)
-	assert.Equal(t, []Recipient{{"Alice", "alice@example.com"}, {"", "carol@example.com"}}, readRecipients(obj))
+	assert.Equal(t, []Recipient{{"Alice", "alice@example.com"}, {"", "carol@example.com"}}, ParseRecipients(obj))
 }
 
 func TestTicksRejectsImplausible(t *testing.T) {

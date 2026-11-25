@@ -25,6 +25,8 @@
 //	hxdiscover items   [-value itemid] [-marker oc-probe]
 //	hxdiscover bytecand -value probeid
 //	hxdiscover ticks   -value probeid -ticks
+//	hxdiscover fields|lens|lentable|subjgap|text|recips|attach|storecheck
+//	hxdiscover probelens -value probeid
 //
 // Real names and addresses are passed only through HXD_MATCH and are never
 // printed.

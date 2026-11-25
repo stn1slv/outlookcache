@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 
@@ -41,22 +40,10 @@ type c7copy struct {
 	obj          []byte
 }
 
-// forEachFraming calls fn for every object framing in p whose declared
-// length fits inside p.
+// forEachFraming calls fn for every object framing in p (see
+// hxstore.ForEachFraming).
 func forEachFraming(p []byte, fn func(o int, id uint64, typ uint16, obj []byte)) {
-	for off := 0; ; {
-		k := bytes.Index(p[off:], objMagic)
-		if k < 0 || off+k+18 > len(p) {
-			return
-		}
-		o := off + k
-		off = o + 4
-		n := uint64(binary.LittleEndian.Uint32(p[o+14:]))
-		if n < 18 || n > uint64(len(p)-o) {
-			continue
-		}
-		fn(o, binary.LittleEndian.Uint64(p[o+4:]), binary.LittleEndian.Uint16(p[o+12:]), p[o:o+int(n)])
-	}
+	hxstore.ForEachFraming(p, func(f hxstore.Framing) { fn(f.Offset, f.ID, f.Type, f.Data) })
 }
 
 // scanConversations calls fn for every conversation-form 0xc7 copy (account ID at
@@ -137,9 +124,10 @@ func (li liveIndex) indexed(blockOff int64, area int) bool {
 
 // current picks the current copy of one object: the copy with the highest
 // stamp; among copies with that stamp, one in a direct index slot (area A)
-// wins. confirmed is true when the chosen copy is in a direct slot.
-// ambiguous is true when copies with the highest stamp differ in status
-// or folder and the index does not pick exactly one of them.
+// wins (the first one when several are). confirmed is true when the
+// chosen copy is in a direct slot. ambiguous is true when the candidates
+// (the indexed tied copies, else all tied copies) differ in status or
+// folder. Same rule as store.pickCurrent.
 func (li liveIndex) current(cs []c7copy) (c c7copy, confirmed, ambiguous bool) {
 	top := cs[0]
 	for _, x := range cs {
@@ -156,15 +144,16 @@ func (li liveIndex) current(cs []c7copy) (c c7copy, confirmed, ambiguous bool) {
 			}
 		}
 	}
-	if len(tiedIndexed) == 1 {
-		return tiedIndexed[0], true, false
+	pool := tied
+	if len(tiedIndexed) > 0 {
+		pool, top, confirmed = tiedIndexed, tiedIndexed[0], true
 	}
-	for _, x := range tied {
+	for _, x := range pool {
 		if x.status != top.status || x.folder != top.folder {
 			ambiguous = true
 		}
 	}
-	return top, len(tiedIndexed) > 1, ambiguous
+	return top, confirmed, ambiguous
 }
 
 // keyFilter selects blocks by key; the zero value selects all blocks.

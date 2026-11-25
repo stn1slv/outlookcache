@@ -19,6 +19,9 @@ func hexID(v uint64) string {
 // ticks reads a .NET ticks u64 (100 ns since 0001-01-01 UTC); nil when the
 // value is not a plausible mail time (1995 to 2100).
 func ticks(obj []byte, at int) *time.Time {
+	if at < 0 || at+8 > len(obj) {
+		return nil
+	}
 	v := binary.LittleEndian.Uint64(obj[at:])
 	if v < ticksUnixEpoch {
 		return nil
@@ -31,17 +34,18 @@ func ticks(obj []byte, at int) *time.Time {
 	return &t
 }
 
-func blockType(data []byte, off int64) uint32 {
-	if off < 0 || off+0x28 > int64(len(data)) {
-		return 0
+// byNumber orders hex IDs (no leading zeros) by their numeric value.
+func byNumber(a, b string) bool {
+	if len(a) != len(b) {
+		return len(a) < len(b)
 	}
-	return binary.LittleEndian.Uint32(data[off+0x10:])
+	return a < b
 }
 
 // buildFolders picks one version of every folder record (a version in a
 // direct index slot wins), keeps folders of mail accounts and returns the
 // folder -> account map.
-func (s *Store) buildFolders(recs []folderRec, ids idSpace, roots map[uint64]map[string]uint64) (map[uint64]Folder, map[uint64]uint64) {
+func (s *Store) buildFolders(recs []folderRec, ids idSpace, roots map[uint64]map[string]uint64) map[uint64]uint64 {
 	best := map[uint64]folderRec{}
 	for _, r := range recs {
 		if !ids.has(r.id) || !ids.has(r.parent) {
@@ -82,8 +86,8 @@ func (s *Store) buildFolders(recs []folderRec, ids idSpace, roots map[uint64]map
 	for _, f := range folders {
 		s.Folders = append(s.Folders, f)
 	}
-	sort.Slice(s.Folders, func(i, j int) bool { return s.Folders[i].ID < s.Folders[j].ID })
-	return folders, account
+	sort.Slice(s.Folders, func(i, j int) bool { return byNumber(s.Folders[i].ID, s.Folders[j].ID) })
+	return account
 }
 
 // buildAccounts creates one account per root with role slots. Its Files/S0
@@ -119,7 +123,7 @@ func (s *Store) buildAccounts(roots map[uint64]map[string]uint64, votes map[uint
 		}
 		s.Accounts = append(s.Accounts, a)
 	}
-	sort.Slice(s.Accounts, func(i, j int) bool { return s.Accounts[i].ID < s.Accounts[j].ID })
+	sort.Slice(s.Accounts, func(i, j int) bool { return byNumber(s.Accounts[i].ID, s.Accounts[j].ID) })
 }
 
 // fillAddresses sets each account's address to the most frequent sender

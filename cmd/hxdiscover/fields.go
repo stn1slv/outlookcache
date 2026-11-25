@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/stn1slv/outlookcache/internal/store"
 )
 
 // Item field offsets (item form; see docs/STORAGE.md).
@@ -137,7 +139,7 @@ func fieldCheck(data []byte, now time.Time, w io.Writer) error {
 				c["after Message-ID: unrelated strings"]++
 			}
 		}
-		if classAt == idAt-1 {
+		if classAt >= 0 && classAt == idAt-1 {
 			c["Message-ID right after class"]++
 		}
 		if classAt >= 0 {
@@ -207,74 +209,8 @@ const (
 	lenMessageID  = 1480
 )
 
-type itemText struct {
-	senderAddr, senderName, class, messageID, preview, subject, topic string
-	ok                                                                map[string]bool // field resolved by the rules
-}
-
-// extractText reads the string run of an item with the length table: the
-// item class is the first string that starts with "IPM." or "REPORT.";
-// every other field is the first string (before the class for the sender,
-// after it for the rest) whose UTF-16 size + 2 equals that field's length
-// entry. The subject falls back to the topic length when no string matches
-// the subject length.
-func extractText(obj []byte, id, conv uint64) (itemText, bool) {
-	t := itemText{ok: map[string]bool{}}
-	s, ok := itemStrings(obj, id, conv)
-	if !ok {
-		return t, false
-	}
-	u16 := func(off int) int { return int(binary.LittleEndian.Uint16(obj[off:])) }
-	size := func(x string) int { return len(encodeU16(x)) + 2 }
-	classAt := -1
-	for k, x := range s {
-		if strings.HasPrefix(x, "IPM.") || strings.HasPrefix(x, "REPORT.") {
-			classAt = k
-			break
-		}
-	}
-	if classAt < 0 {
-		return t, false
-	}
-	t.class, t.ok["class"] = s[classAt], true
-	used := map[int]bool{classAt: true}
-	find := func(from, to, length int, accept func(string) bool) (string, bool) {
-		if length <= 2 {
-			return "", false
-		}
-		step := 1
-		if from > to {
-			step = -1
-		}
-		for k := from; k != to; k += step {
-			if k >= 0 && k < len(s) && !used[k] && size(s[k]) == length && (accept == nil || accept(s[k])) {
-				used[k] = true
-				return s[k], true
-			}
-		}
-		return "", false
-	}
-	isID := func(x string) bool { return strings.HasPrefix(x, "<") && strings.HasSuffix(x, ">") }
-	t.senderAddr, t.ok["senderAddr"] = find(classAt-1, -1, u16(lenSenderAddr), func(x string) bool { return strings.Contains(x, "@") })
-	t.senderName, t.ok["senderName"] = find(classAt-1, -1, u16(lenSenderName), nil)
-	t.messageID, t.ok["messageID"] = find(classAt+1, len(s), u16(lenMessageID), isID)
-	t.preview, t.ok["preview"] = find(classAt+1, len(s), u16(lenPreview), nil)
-	either := func(length int) (string, bool) { // after the class first, then before it
-		if v, ok := find(classAt+1, len(s), length, nil); ok {
-			return v, true
-		}
-		return find(classAt-1, -1, length, nil)
-	}
-	t.subject, t.ok["subject"] = either(u16(lenSubject))
-	t.topic, t.ok["topic"] = either(u16(lenTopic))
-	if !t.ok["subject"] && t.ok["topic"] {
-		t.subject, t.ok["subject (from topic)"] = t.topic, true
-	}
-	return t, true
-}
-
-// textCheck runs extractText on all current items and prints how often
-// each field resolves. For probe items it also prints whether the subject
+// textCheck runs store.ParseItemText on all current items and prints how
+// often each field is found. For probe items it also prints whether the subject
 // equals the expected synthetic text start (the subject itself is printed
 // only for probes).
 func textCheck(data []byte, w io.Writer) error {
@@ -288,24 +224,23 @@ func textCheck(data []byte, w io.Writer) error {
 	}
 	c := map[string]int{}
 	for _, it := range cur {
-		t, ok := extractText(it.obj, it.id, it.conv)
+		t, ok := store.ParseItemText(it.obj, it.id, it.conv)
 		c["items"]++
 		if !ok {
 			c["no class or run"]++
 			continue
 		}
-		for _, f := range []string{"class", "messageID", "senderAddr", "senderName", "preview", "subject", "subject (from topic)", "topic"} {
-			if t.ok[f] {
+		for f, v := range map[string]string{
+			"class": t.Class, "messageID": t.MessageID, "senderAddr": t.SenderAddr, "senderName": t.SenderName,
+			"preview": t.Preview, "subject": t.Subject,
+		} {
+			if v != "" {
 				c["resolved: "+f]++
 			}
 		}
 		if probeSubject(it.obj) {
-			subj := t.subject
-			if !probeFolderName.MatchString(strings.ReplaceAll(strings.ToLower(subj), " ", "-")) {
-				subj = shape(subj)
-			}
-			_, _ = fmt.Fprintf(w, "probe item %x subject=%s subject_from_topic=%t senderAddr=%t senderName=%t messageID=%t preview=%t\n",
-				it.id, subj, t.ok["subject (from topic)"], t.ok["senderAddr"], t.ok["senderName"], t.ok["messageID"], t.ok["preview"])
+			_, _ = fmt.Fprintf(w, "probe item %x subject=%s senderAddr=%t senderName=%t messageID=%t preview=%t\n",
+				it.id, probeText(t.Subject), t.SenderAddr != "", t.SenderName != "", t.MessageID != "", t.Preview != "")
 		}
 	}
 	printCounts(w, "text extraction (counts only)", c)

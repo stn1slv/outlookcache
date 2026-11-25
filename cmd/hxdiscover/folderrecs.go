@@ -165,6 +165,15 @@ func folderTree(data []byte, r redactor, match string, w io.Writer) error {
 // probeFolderName is the strict form of a synthetic test folder name.
 var probeFolderName = regexp.MustCompile(`^oc-probe-[a-z0-9-]{1,40}$`)
 
+// probeText returns a subject quoted when it is a strict probe text
+// (oc-probe- followed by lower-case words), else only its shape.
+func probeText(s string) string {
+	if probeFolderName.MatchString(strings.ReplaceAll(strings.ToLower(s), " ", "-")) {
+		return fmt.Sprintf("%q", s)
+	}
+	return shape(s)
+}
+
 // treeName prints a folder name only when it is a strict probe name or a
 // schema word that the redactor prints unchanged; otherwise its shape.
 func treeName(r redactor, name string) string {

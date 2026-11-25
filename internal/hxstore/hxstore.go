@@ -76,6 +76,9 @@ type Damage struct {
 	Offset int64  `json:"offset"`
 	Length int    `json:"length"`
 	Reason string `json:"reason"`
+	// BlockType is the type field of a block whose header CRC passed; 0
+	// when the header could not be trusted.
+	BlockType uint32 `json:"block_type,omitempty"`
 }
 
 // Stats counts what a scan found.
@@ -110,7 +113,7 @@ func Scan(data []byte, file string, fn func(Block) error) (Stats, []Damage, erro
 		st.Candidates++
 		blk, n, reason := decodeBlock(data, start)
 		if reason != "" {
-			damage = append(damage, Damage{File: file, Offset: int64(start), Length: n, Reason: reason})
+			damage = append(damage, Damage{File: file, Offset: int64(start), Length: n, Reason: reason, BlockType: blk.Type})
 			continue
 		}
 		st.Valid++
@@ -137,23 +140,38 @@ func decodeBlock(data []byte, start int) (Block, int, string) {
 		return Block{}, blockHeaderSize, "header crc mismatch"
 	}
 	typ := binary.LittleEndian.Uint32(h[0x10:])
+	bad := Block{Type: typ} // carries the trusted type for damage reports
 	plen32 := binary.LittleEndian.Uint32(h[0x14:])
 	ilen32 := binary.LittleEndian.Uint32(h[0x18:])
 	if plen32 > maxBlockLen || ilen32 > maxBlockLen { // compare before int conversion
-		return Block{}, blockHeaderSize, "length over 32 MiB cap"
+		return bad, blockHeaderSize, "length over 32 MiB cap"
 	}
 	plen, ilen := int(plen32), int(ilen32)
 	size := blockHeaderSize + plen
 	if len(data)-start < size {
-		return Block{}, len(data) - start, "truncated payload"
+		return bad, len(data) - start, "truncated payload"
 	}
 	if crc32.ChecksumIEEE(data[start+8:start+size]) != binary.LittleEndian.Uint32(h[4:]) {
-		return Block{}, size, "payload crc mismatch"
+		return bad, size, "payload crc mismatch"
 	}
 	out, err := DecodeLZ4(data[start+blockHeaderSize:start+size], ilen)
 	if err != nil {
-		return Block{}, size, fmt.Sprintf("decompress: %v", err)
+		return bad, size, fmt.Sprintf("decompress: %v", err)
 	}
 	key := binary.LittleEndian.Uint64(h[0x20:])
 	return Block{Offset: int64(start), Type: typ, Key: key, Payload: out}, size, ""
+}
+
+// DecodeAt validates and decodes the single block that starts at offset,
+// with the same checks as Scan.
+func DecodeAt(data []byte, offset int64) (Block, error) {
+	if offset < headerSize || offset >= int64(len(data)) || offset+16 > int64(len(data)) ||
+		!bytes.Equal(data[offset+8:offset+16], blockMagic) {
+		return Block{}, fmt.Errorf("%w: no block at offset %d", ErrNotHxStore, offset)
+	}
+	blk, _, reason := decodeBlock(data, int(offset))
+	if reason != "" {
+		return Block{}, fmt.Errorf("block at offset %d: %s", offset, reason)
+	}
+	return blk, nil
 }

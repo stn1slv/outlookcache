@@ -1,38 +1,21 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"regexp"
-	"strings"
 
 	"github.com/stn1slv/outlookcache/internal/hxstore"
+	"github.com/stn1slv/outlookcache/internal/store"
 )
 
-var fileNameRe = regexp.MustCompile(`^[^/\\:*?"<>|@]{1,200}\.[A-Za-z0-9]{1,8}$`)
-
-const attachSizeAt = 670 // u32 in a 0x168 object (one probe; see docs)
-
-// attachmentName returns the first UTF-16 string in a 0x168 object that
-// looks like a file name and starts right after a sort-key terminator
-// (a 0x00 byte after a non-zero byte).
-func attachmentName(obj []byte) (string, bool) {
-	for _, t := range tokenize(obj) {
-		if t.kind != tokU16 || !fileNameRe.MatchString(t.text) || t.off < 2 {
-			continue
-		}
-		if obj[t.off-1] == 0 && obj[t.off-2] != 0 {
-			return t.text, true
-		}
-	}
-	return "", false
-}
+// probeFileName matches the synthetic attachment names of the probes only.
+var probeFileName = regexp.MustCompile(`^oc-probe-[a-z0-9-]{1,40}(\[[0-9]{1,12}\])?\.txt$`)
 
 // attachmentCheck groups the 0x168 objects by owning item and prints
 // counts: items with the has-attachments flag and how many of them have a
-// named attachment object, plus the size field range. For probe items it
-// prints the names (synthetic) and sizes.
+// named attachment object (store.ParseAttachment), plus the size field
+// range. It prints names and sizes only for strict probe names.
 func attachmentCheck(data []byte, w io.Writer) error {
 	li, err := readLiveIndex(data)
 	if err != nil {
@@ -44,9 +27,9 @@ func attachmentCheck(data []byte, w io.Writer) error {
 	}
 	objs := map[uint64][][]byte{}
 	if _, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		forEachFraming(b.Payload, func(_ int, id uint64, typ uint16, obj []byte) {
-			if typ == 0x168 {
-				objs[id] = append(objs[id], obj)
+		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) {
+			if f.Type == 0x168 {
+				objs[f.ID] = append(objs[f.ID], f.Data)
 			}
 		})
 		return nil
@@ -59,15 +42,12 @@ func attachmentCheck(data []byte, w io.Writer) error {
 		named := 0
 		var probe []string
 		for _, o := range objs[id] {
-			name, ok := attachmentName(o)
+			a, ok := store.ParseAttachment(o)
 			if !ok {
 				continue
 			}
 			named++
-			size := -1
-			if len(o) >= attachSizeAt+4 {
-				size = int(binary.LittleEndian.Uint32(o[attachSizeAt:]))
-			}
+			size := a.Size
 			switch {
 			case size <= 0:
 				c["size field: zero or missing"]++
@@ -76,8 +56,8 @@ func attachmentCheck(data []byte, w io.Writer) error {
 			default:
 				c["size field: larger"]++
 			}
-			if strings.HasPrefix(strings.ToLower(name), markerPrefix) {
-				probe = append(probe, fmt.Sprintf("%s size=%d", name, size))
+			if probeFileName.MatchString(a.Name) {
+				probe = append(probe, fmt.Sprintf("%q size=%d", a.Name, size))
 			}
 		}
 		c[fmt.Sprintf("flag=%t, copies with a file name: %t", flag, named > 0)]++

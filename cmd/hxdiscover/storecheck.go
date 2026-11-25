@@ -39,12 +39,13 @@ func storeCheck(data []byte, w io.Writer) error {
 			}
 		}
 		if strings.HasPrefix(strings.ToLower(m.Subject), markerPrefix) {
-			_, _ = fmt.Fprintf(w, "probe %s folder=%s read=%t to=%d cc=%d attachments=%d confirmed=%t subject=%q\n",
-				m.ID, m.FolderID, m.Read, len(m.To), len(m.Cc), len(m.Attachments), m.Confirmed, m.Subject)
+			_, _ = fmt.Fprintf(w, "probe %s folder=%s read=%t to=%d cc=%d attachments=%d confirmed=%t subject=%s\n",
+				m.ID, m.FolderID, m.Read, len(m.To), len(m.Cc), len(m.Attachments), m.Confirmed, probeText(m.Subject))
 		}
 	}
 	printCounts(w, "messages (counts only)", c)
-	_, _ = fmt.Fprintf(w, "stats: valid=%d undecoded=%d damage=%d stale_damaged=%d skipped=%d unconfirmed=%d ambiguous=%d\n",
-		s.Stats.ValidBlocks, s.Stats.UndecodedBlocks, len(s.Stats.Damage), s.Stats.StaleDamaged, s.Stats.SkippedRecords, s.Stats.Unconfirmed, s.Stats.Ambiguous)
+	_, _ = fmt.Fprintf(w, "stats: valid=%d undecoded=%d damage=%d unindexed_damaged=%d skipped=%d unconfirmed=%d ambiguous=%d index_areas_differ=%d\n",
+		s.Stats.ValidBlocks, s.Stats.UndecodedBlocks, len(s.Stats.Damage), s.Stats.UnindexedDamaged, s.Stats.SkippedRecords,
+		s.Stats.Unconfirmed, s.Stats.Ambiguous, s.Stats.IndexAreasDiffer)
 	return nil
 }

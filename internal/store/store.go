@@ -65,11 +65,22 @@ type Message struct {
 type Stats struct {
 	ValidBlocks     int              `json:"valid_blocks"`
 	UndecodedBlocks int              `json:"undecoded_blocks"` // type-16 blocks (format unknown)
-	Damage          []hxstore.Damage `json:"damage,omitempty"` // failing blocks that the index points at
-	StaleDamaged    int              `json:"stale_damaged"`    // failing blocks the index does not point at
-	SkippedRecords  int              `json:"skipped_records"`  // items without a readable string run
-	Unconfirmed     int              `json:"unconfirmed"`
-	Ambiguous       int              `json:"ambiguous"`
+	Damage          []hxstore.Damage `json:"damage,omitempty"` // failing blocks in a direct index slot
+	// UnindexedDamaged counts failing blocks without a direct index slot.
+	// Most are old copies, but a live block whose index entry sits in an
+	// overflow bucket is counted here too.
+	UnindexedDamaged int `json:"unindexed_damaged"`
+	// SkippedRecords counts items that have no copy with a known folder or
+	// whose chosen copy has no readable string run.
+	SkippedRecords int `json:"skipped_records"`
+	Unconfirmed    int `json:"unconfirmed"`
+	Ambiguous      int `json:"ambiguous"`
+	// IndexUnreadable is true when the block index has an unexpected
+	// layout; every message is then unconfirmed.
+	IndexUnreadable bool `json:"index_unreadable,omitempty"`
+	// IndexAreasDiffer counts index slots where areas A and B differ; the
+	// reader uses area A (which area is current is UNVERIFIED).
+	IndexAreasDiffer int `json:"index_areas_differ"`
 }
 
 // Store is the decoded content of one HxStore.hxd snapshot.
@@ -86,15 +97,33 @@ type objVersion struct {
 	direct bool
 }
 
-// pickVersion prefers a version in a direct index slot, else the last one
-// seen in file order.
-func pickVersion(vs []objVersion) objVersion {
+// versionBlock chooses the block whose versions of an item's list or
+// attachment objects are used: the block of the chosen item copy when it
+// holds a version, else the first block in a direct index slot, else the
+// last block in file order.
+func versionBlock(vs []objVersion, itemBlock int64) int64 {
 	for _, v := range vs {
-		if v.direct {
-			return v
+		if v.block == itemBlock {
+			return itemBlock
 		}
 	}
-	return vs[len(vs)-1]
+	for _, v := range vs {
+		if v.direct {
+			return v.block
+		}
+	}
+	return vs[len(vs)-1].block
+}
+
+// inBlock returns the versions stored in block.
+func inBlock(vs []objVersion, block int64) []objVersion {
+	var out []objVersion
+	for _, v := range vs {
+		if v.block == block {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 type rawItem struct {
@@ -112,10 +141,15 @@ func Load(data []byte, file string) (*Store, error) {
 	if !h.Supported() {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedVersion, h.Version)
 	}
+	s := &Store{}
 	ix, err := hxstore.ReadIndex(data)
-	if err != nil {
+	switch {
+	case errors.Is(err, hxstore.ErrIndexLayout):
+		s.Stats.IndexUnreadable = true
+	case err != nil:
 		return nil, err
 	}
+	s.Stats.IndexAreasDiffer = ix.AreasDiffer
 
 	// Pass 1: IDs, compact metadata and small records.
 	ids := idSpace{}
@@ -138,7 +172,7 @@ func Load(data []byte, file string) (*Store, error) {
 			dirVotes[b.Key][d]++
 		}
 		for _, r := range readFolderRecords(b.Payload, idSpace(nil)) {
-			r.block, r.direct = b.Offset, direct
+			r.direct = direct
 			recs = append(recs, r)
 		}
 		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) {
@@ -165,63 +199,88 @@ func Load(data []byte, file string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{Stats: Stats{ValidBlocks: st.Valid}}
+	s.Stats.ValidBlocks = st.Valid
 	for _, d := range damage {
 		switch {
-		case blockType(data, d.Offset) == 16:
+		case d.BlockType == 16:
 			s.Stats.UndecodedBlocks++
 		case ix.Direct(d.Offset):
 			s.Stats.Damage = append(s.Stats.Damage, d)
 		default:
-			s.Stats.StaleDamaged++
+			s.Stats.UnindexedDamaged++
 		}
 	}
 
-	_, folderAccount := s.buildFolders(recs, ids, roots2roles(roots))
+	roles := roots2roles(roots)
+	folderAccount := s.buildFolders(recs, ids, roles)
 
 	// Choose the current copy of every item.
 	copies := map[uint64][]itemCopy{}
+	noFolder := map[uint64]bool{}
 	for _, r := range raws {
-		if ids.has(r.account) || !ids.has(r.folder) {
-			continue // conversation form or another layout
-		}
-		if !ids.has(r.conv) {
-			r.conv = 0
+		switch {
+		case ids.has(r.account):
+			continue // conversation form
+		case !ids.has(r.folder):
+			noFolder[r.id] = true
+			continue
 		}
 		copies[r.id] = append(copies[r.id], r.itemCopy)
+	}
+	for id := range noFolder {
+		if _, ok := copies[id]; !ok {
+			s.Stats.SkippedRecords++
+		}
 	}
 	type chosen struct {
 		itemCopy
 		confirmed, ambiguous bool
 	}
 	picks := make(map[uint64]chosen, len(copies))
-	need := map[int64]bool{}
+	// chosenVers holds, per item, the list and attachment versions to read.
+	chosenVers := make(map[uint64]map[uint16][]objVersion, len(copies))
+	need := map[int64]map[int]bool{} // block -> framing offsets to keep
+	want := func(block int64, frame int) {
+		if need[block] == nil {
+			need[block] = map[int]bool{}
+		}
+		need[block][frame] = true
+	}
 	for id, cs := range copies {
 		c, conf, amb := pickCurrent(cs)
 		picks[id] = chosen{c, conf, amb}
-		need[c.block] = true
-		for _, t := range []uint16{typeTo, typeCc, typeBcc} {
-			if vs := lists[t][id]; len(vs) > 0 {
-				need[pickVersion(vs).block] = true
+		want(c.block, c.frame)
+		for _, t := range []uint16{typeTo, typeCc, typeBcc, typeAttachment} {
+			vs := lists[t][id]
+			if len(vs) == 0 {
+				continue
 			}
-		}
-		for _, v := range lists[typeAttachment][id] {
-			need[v.block] = true
+			sel := inBlock(vs, versionBlock(vs, c.block))
+			if chosenVers[id] == nil {
+				chosenVers[id] = map[uint16][]objVersion{}
+			}
+			chosenVers[id][t] = sel
+			for _, v := range sel {
+				want(v.block, v.frame)
+			}
 		}
 	}
 
-	// Pass 2: decode only the blocks that hold chosen objects.
+	// Pass 2: decode only the blocks that hold chosen objects and keep only
+	// those objects.
 	frames := map[int64]map[int][]byte{}
-	if _, _, err := hxstore.Scan(data, file, func(b hxstore.Block) error {
-		if !need[b.Offset] {
-			return nil
+	for block, offs := range need {
+		b, err := hxstore.DecodeAt(data, block)
+		if err != nil {
+			return nil, err
 		}
 		m := map[int][]byte{}
-		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) { m[f.Offset] = f.Data })
-		frames[b.Offset] = m
-		return nil
-	}); err != nil {
-		return nil, err
+		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) {
+			if offs[f.Offset] {
+				m[f.Offset] = f.Data
+			}
+		})
+		frames[block] = m
 	}
 	obj := func(block int64, frame int) []byte { return frames[block][frame] }
 
@@ -231,13 +290,17 @@ func Load(data []byte, file string) (*Store, error) {
 			s.Stats.SkippedRecords++
 			continue
 		}
-		text, ok := readItemText(o, id, p.conv)
+		text, ok := ParseItemText(o, id, p.conv) // the anchor holds the raw value
 		if !ok {
 			s.Stats.SkippedRecords++
 			continue
 		}
+		conv := p.conv
+		if !ids.has(conv) {
+			conv = 0
+		}
 		m := Message{
-			ID: hexID(id), ConversationID: hexID(p.conv), FolderID: hexID(p.folder), AccountID: hexID(folderAccount[p.folder]),
+			ID: hexID(id), ConversationID: hexID(conv), FolderID: hexID(p.folder), AccountID: hexID(folderAccount[p.folder]),
 			Subject: text.Subject, Preview: text.Preview, MessageID: text.MessageID, ItemClass: text.Class,
 			Read: p.status&0x02 != 0, HasAttachments: o[itemAttachAt]&0x40 != 0,
 			Confirmed: p.confirmed, Ambiguous: p.ambiguous,
@@ -257,19 +320,20 @@ func Load(data []byte, file string) (*Store, error) {
 		case 2:
 			m.Importance = "high"
 		}
+		vers := chosenVers[id]
 		for t, dst := range map[uint16]*[]Recipient{typeTo: &m.To, typeCc: &m.Cc, typeBcc: &m.Bcc} {
-			if vs := lists[t][id]; len(vs) > 0 {
-				v := pickVersion(vs)
+			for _, v := range vers[t] {
 				if ro := obj(v.block, v.frame); ro != nil {
-					*dst = readRecipients(ro)
+					*dst = ParseRecipients(ro)
+					break
 				}
 			}
 		}
-		seenAtt := map[string]bool{}
-		for _, v := range lists[typeAttachment][id] {
+		seenAtt := map[Attachment]bool{}
+		for _, v := range vers[typeAttachment] {
 			if ao := obj(v.block, v.frame); ao != nil {
-				if a, ok := readAttachment(ao); ok && !seenAtt[a.Name] {
-					seenAtt[a.Name] = true
+				if a, ok := ParseAttachment(ao); ok && !seenAtt[a] {
+					seenAtt[a] = true
 					m.Attachments = append(m.Attachments, a)
 				}
 			}
@@ -282,7 +346,7 @@ func Load(data []byte, file string) (*Store, error) {
 		}
 		s.Messages = append(s.Messages, m)
 	}
-	sort.Slice(s.Messages, func(i, j int) bool { return s.Messages[i].ID < s.Messages[j].ID })
+	sort.Slice(s.Messages, func(i, j int) bool { return byNumber(s.Messages[i].ID, s.Messages[j].ID) })
 	// Blocks keyed by an item vote for the item's account, like blocks of
 	// its folders and of the root.
 	owner := make(map[uint64]uint64, len(folderAccount)+len(picks))
@@ -294,7 +358,7 @@ func Load(data []byte, file string) (*Store, error) {
 			owner[id] = a
 		}
 	}
-	s.buildAccounts(roots2roles(roots), dirVotes, owner)
+	s.buildAccounts(roles, dirVotes, owner)
 	s.fillAddresses()
 	return s, nil
 }

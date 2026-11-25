@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 )
 
@@ -67,10 +68,11 @@ type itemCopy struct {
 	direct           bool
 }
 
-// pickCurrent returns the copy with the highest stamp; on a stamp tie the
-// copy in a direct index slot wins. confirmed: the chosen copy is in a
-// direct slot. ambiguous: tied copies differ in status or folder and the
-// index does not pick exactly one.
+// pickCurrent returns the copy with the highest stamp; among copies with
+// that stamp, a copy in a direct index slot wins. confirmed: the returned
+// copy is in a direct slot. ambiguous: the candidates the choice was made
+// from (the direct copies when there are any, else all tied copies)
+// differ in status or folder.
 func pickCurrent(cs []itemCopy) (c itemCopy, confirmed, ambiguous bool) {
 	top := cs[0]
 	for _, x := range cs {
@@ -87,15 +89,16 @@ func pickCurrent(cs []itemCopy) (c itemCopy, confirmed, ambiguous bool) {
 			}
 		}
 	}
-	if len(direct) == 1 {
-		return direct[0], true, false
+	pool := tied
+	if len(direct) > 0 {
+		pool, top, confirmed = direct, direct[0], true
 	}
-	for _, x := range tied {
+	for _, x := range pool {
 		if x.status != top.status || x.folder != top.folder {
 			ambiguous = true
 		}
 	}
-	return top, len(direct) > 1, ambiguous
+	return top, confirmed, ambiguous
 }
 
 // utf16At decodes a NUL-terminated UTF-16LE string that starts at off and
@@ -125,20 +128,24 @@ func decodeU16(b []byte) string {
 
 func u16Size(s string) int { return 2*len(utf16.Encode([]rune(s))) + 2 }
 
-// itemText holds the strings of an item. Empty means absent or not found.
-type itemText struct {
+// ItemText holds the strings of an item. Empty means absent or not found.
+type ItemText struct {
 	SenderAddr, SenderName, Class, MessageID, Preview, Subject string
 }
 
-// readItemText reads the string run that follows the anchor
-// [item ID][00 00 c7 00 + 8 zero bytes][conversation ID], using the length
-// table: the class is the first string that starts with "IPM." or
-// "REPORT."; every other field is the first unused string whose size
-// matches its table entry (sender before the class; Message-ID and preview
-// after it; subject after it first, then before it). When no string
-// matches the subject entry, the conversation topic is used.
-func readItemText(obj []byte, id, conv uint64) (itemText, bool) {
-	var t itemText
+// ParseItemText reads the string run of an item object (item form) that
+// follows the anchor [item ID][00 00 c7 00 + 8 zero bytes][conversation
+// ID], where conv is the raw u64 at +436. It uses the length table: the
+// class is the first string that starts with "IPM." or "REPORT."; every
+// other field is the nearest unused string whose size matches its entry
+// (sender before the class; Message-ID and preview after it; subject and
+// topic after it first, then before it). Without a subject, the topic is
+// used.
+func ParseItemText(obj []byte, id, conv uint64) (ItemText, bool) {
+	var t ItemText
+	if len(obj) < itemMinLen {
+		return t, false
+	}
 	anchor := binary.LittleEndian.AppendUint64(nil, id)
 	anchor = append(anchor, 0, 0, typeMessage, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 	anchor = binary.LittleEndian.AppendUint64(anchor, conv)
@@ -195,6 +202,9 @@ func readItemText(obj []byte, id, conv uint64) (itemText, bool) {
 	t.MessageID = find(classAt+1, len(run), u16(lenMessageID), func(s string) bool {
 		return strings.HasPrefix(s, "<") && strings.HasSuffix(s, ">")
 	})
+	// The preview comes before the subject after the class (positions +1
+	// to +4 against +3 and later on the whole store), so it is taken first;
+	// when both have the same size the earlier string is the preview.
 	t.Preview = find(classAt+1, len(run), u16(lenPreview), nil)
 	t.Subject = either(u16(lenSubject))
 	if topic := either(u16(lenTopic)); t.Subject == "" {
@@ -209,40 +219,48 @@ type Recipient struct {
 	Address string `json:"address"`
 }
 
-// stringStarts returns the offsets where a NUL-terminated UTF-16 string
-// may start: right after a 0x00 byte that follows a non-zero byte (the end
-// of a sort key or of a length field) or right after a 0x0000 terminator.
-func stringStarts(b []byte) []int {
-	var out []int
-	for i := 2; i < len(b)-1; i++ {
-		if b[i-1] == 0 && (b[i-2] != 0 || i >= 3 && b[i-3] == 0) && b[i] != 0 {
-			out = append(out, i)
+var emailRe = regexp.MustCompile(`^[A-Za-z0-9._%+'=-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$`)
+
+// printable reports a non-empty string made only of printable characters.
+func printable(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || !unicode.IsPrint(r) && r != ' ' {
+			return false
 		}
 	}
-	return out
+	return true
 }
 
-// readRecipients reads a To/Cc/Bcc object: every NUL-terminated UTF-16
-// string with "@" and no space is an address; the string right after its
-// terminator is the display name. Repeated addresses count once.
-func readRecipients(obj []byte) []Recipient {
+// ParseRecipients reads a To/Cc/Bcc object. An entry is a sort key, then
+// the address and the display name as adjacent NUL-terminated UTF-16LE
+// strings. An address starts after a UTF-16 unit below 0x20 and must look
+// like an e-mail address; the name is the string right after its
+// terminator when it is printable. Repeated addresses count once.
+func ParseRecipients(obj []byte) []Recipient {
 	var out []Recipient
 	seen := map[string]int{}
 	for i := 0; i+4 <= len(obj); i++ {
 		if obj[i] != '@' || obj[i+1] != 0 {
 			continue
 		}
-		// Walk back to the start of the string.
 		s := i
 		for s-2 >= 0 && binary.LittleEndian.Uint16(obj[s-2:]) >= 0x20 && i-s < 512 {
 			s -= 2
 		}
 		addr, next, ok := utf16At(obj, s, 512)
-		if !ok || strings.ContainsAny(addr, " \t") || !strings.Contains(addr, "@") {
+		if !ok || !emailRe.MatchString(addr) {
 			continue
 		}
 		i = next - 1
-		name, _, _ := utf16At(obj, next, 512)
+		name, after, ok := utf16At(obj, next, 512)
+		if ok && printable(name) {
+			i = after - 1 // a name that is itself an address is not another entry
+		} else {
+			name = ""
+		}
 		key := strings.ToLower(addr)
 		if k, dup := seen[key]; dup {
 			if out[k].Name == "" {
@@ -262,24 +280,31 @@ type Attachment struct {
 	Size int64  `json:"size"`
 }
 
-var fileNameRe = regexp.MustCompile(`^[^/\\:*?"<>|@]{1,200}\.[A-Za-z0-9]{1,8}$`)
+// fileNameRe is the shape of an attachment file name: no control
+// characters, no path separators and an extension. macOS allows ':' and
+// other characters that Windows does not, so they are accepted.
+var fileNameRe = regexp.MustCompile(`^[^\x00-\x1f/\\]{1,255}\.[A-Za-z0-9]{1,10}$`)
 
-// readAttachment reads a 0x168 object: the first string that looks like a
-// file name and starts right after a sort-key terminator, and the u32 size
-// at +670.
-func readAttachment(obj []byte) (Attachment, bool) {
-	for _, i := range stringStarts(obj) {
-		if obj[i-2] == 0 {
-			continue // after a terminator, not after a sort key
+// ParseAttachment reads a 0x168 object: the file name is the first string
+// that starts right after a UTF-16 unit from 0x01 to 0x1f (the end of a
+// sort key) and has the shape of a file name; the size is the u32 at +670.
+// A string that only ends in a file name, such as a cache path, is not
+// taken. A file name without an extension is not found (UNVERIFIED whether
+// Outlook stores such names differently).
+func ParseAttachment(obj []byte) (Attachment, bool) {
+	for i := 2; i+2 <= len(obj); i++ {
+		if obj[i-1] != 0 || obj[i-2] == 0 || obj[i-2] >= 0x20 || obj[i] == 0 && obj[i+1] == 0 {
+			continue
 		}
 		s, _, ok := utf16At(obj, i, 260)
-		if ok && fileNameRe.MatchString(s) {
-			a := Attachment{Name: s}
-			if len(obj) >= attachSizeAt+4 {
-				a.Size = int64(binary.LittleEndian.Uint32(obj[attachSizeAt:]))
-			}
-			return a, true
+		if !ok || !printable(s) || !fileNameRe.MatchString(s) {
+			continue
 		}
+		a := Attachment{Name: s}
+		if len(obj) >= attachSizeAt+4 {
+			a.Size = int64(binary.LittleEndian.Uint32(obj[attachSizeAt:]))
+		}
+		return a, true
 	}
 	return Attachment{}, false
 }

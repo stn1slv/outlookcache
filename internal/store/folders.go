@@ -3,7 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
-	"strconv"
+	"unicode/utf16"
 )
 
 var (
@@ -15,7 +15,6 @@ var (
 type folderRec struct {
 	id, parent, owner uint64
 	name              string
-	block             int64
 	direct            bool
 }
 
@@ -85,7 +84,8 @@ func readRootSlots(p []byte, key uint64) (map[string]uint64, bool) {
 		}
 		id := binary.LittleEndian.Uint64(p[at+10:])
 		owner := binary.LittleEndian.Uint64(p[at+22:])
-		return id, owner == key && binary.LittleEndian.Uint64(p[at+30:]) == id
+		return id, owner == key && binary.LittleEndian.Uint64(p[at+30:]) == id &&
+			binary.LittleEndian.Uint64(p[at+38:]) == key
 	}
 	if _, ok := ref(861); !ok {
 		return nil, false
@@ -118,17 +118,15 @@ func filesDirs(p []byte) []string {
 			i += 2
 		}
 		if len(digits) > 0 {
-			if _, err := strconv.Atoi(string(digits)); err == nil {
-				out = append(out, string(digits))
-			}
+			out = append(out, string(digits))
 		}
 	}
 }
 
 func encodeU16(s string) []byte {
 	var b []byte
-	for _, r := range s {
-		b = binary.LittleEndian.AppendUint16(b, uint16(r))
+	for _, u := range utf16.Encode([]rune(s)) {
+		b = binary.LittleEndian.AppendUint16(b, u)
 	}
 	return b
 }

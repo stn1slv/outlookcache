@@ -3,6 +3,7 @@ package hxstore
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -17,37 +18,50 @@ const (
 	indexAreaSize = IndexSlots * indexSlotSize
 )
 
+// ErrIndexLayout reports a header whose block index areas do not have the
+// expected place and size.
+var ErrIndexLayout = errors.New("unexpected block index layout")
+
 // Index is the block index of the store: a hash table of 5-byte slots. A
 // used slot holds a block offset / 256 (u32) and a size class (one byte).
 // About a fifth of the entries sit in overflow buckets whose storage is not
-// decoded, so a block that is not in a direct slot may still be live.
+// decoded, so a block that is not in a direct slot may still be live. The
+// header holds two areas, A and B; which one is current is not known
+// (UNVERIFIED), so this type reads area A and counts the slots where B
+// differs.
 type Index struct {
 	Entries         uint32 // header count of index entries
 	OverflowBuckets uint32 // header count of overflow buckets
+	AreasDiffer     int    // used slots whose value differs between A and B
 	direct          map[uint32]bool
 }
 
-// ReadIndex reads index area A. It fails when the header does not describe
-// two areas of the expected size inside the file.
+// ReadIndex reads index area A and compares it with area B. It fails with
+// ErrIndexLayout when the header does not describe two areas of the
+// expected size inside the file.
 func ReadIndex(data []byte) (Index, error) {
 	if len(data) < headerSize+0x40 {
-		return Index{}, ErrNotHxStore
+		return Index{}, ErrIndexLayout
 	}
 	a := binary.LittleEndian.Uint64(data[hdrIndexA:])
 	b := binary.LittleEndian.Uint64(data[hdrIndexB:])
 	n := uint64(len(data))
 	if a == 0 || b <= a || b-a != indexAreaSize || b >= n || indexAreaSize > n-b {
-		return Index{}, fmt.Errorf("%w: unexpected index areas %#x %#x", ErrNotHxStore, a, b)
+		return Index{}, fmt.Errorf("%w: areas at %#x and %#x", ErrIndexLayout, a, b)
 	}
 	ix := Index{
 		Entries:         binary.LittleEndian.Uint32(data[hdrIndexCounts:]),
 		OverflowBuckets: binary.LittleEndian.Uint32(data[hdrIndexCounts+4:]),
 		direct:          map[uint32]bool{},
 	}
-	area := data[a : a+indexAreaSize]
-	for i := 0; i+indexSlotSize <= len(area); i += indexSlotSize {
-		if v := binary.LittleEndian.Uint32(area[i:]); v != 0 {
-			ix.direct[v] = true
+	areaA, areaB := data[a:a+indexAreaSize], data[b:b+indexAreaSize]
+	for i := 0; i+indexSlotSize <= len(areaA); i += indexSlotSize {
+		va, vb := binary.LittleEndian.Uint32(areaA[i:]), binary.LittleEndian.Uint32(areaB[i:])
+		if va != 0 {
+			ix.direct[va] = true
+		}
+		if va != vb {
+			ix.AreasDiffer++
 		}
 	}
 	return ix, nil
@@ -77,7 +91,9 @@ var framingMagic = []byte{0x06, 0x00, 0x70, 0x05}
 func FramingMagic() []byte { return append([]byte(nil), framingMagic...) }
 
 // ForEachFraming calls fn for every framing in payload whose declared
-// length fits inside the payload.
+// length fits inside the payload. The scan continues after the end of each
+// accepted framing, so bytes inside an object are never read as another
+// framing (no framing starts inside another one on the observed store).
 func ForEachFraming(payload []byte, fn func(Framing)) {
 	for off := 0; ; {
 		k := bytes.Index(payload[off:], framingMagic)
@@ -94,5 +110,6 @@ func ForEachFraming(payload []byte, fn func(Framing)) {
 			Offset: o, ID: binary.LittleEndian.Uint64(payload[o+4:]), Type: binary.LittleEndian.Uint16(payload[o+12:]),
 			Data: payload[o : o+int(n)],
 		})
+		off = o + int(n)
 	}
 }

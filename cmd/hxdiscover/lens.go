@@ -124,16 +124,16 @@ func lengthTableCheck(data []byte, w io.Writer) error {
 		name string
 		off  int
 	}{
-		{"sender address", 1648},
-		{"sender name", 1640},
+		{"sender address", lenSenderAddr},
+		{"sender name", lenSenderName},
 		{"+1636", 1636},
 		{"+1644", 1644},
 		{"item class", 1488},
-		{"Message-ID", 1480},
-		{"preview", 1556},
-		{"subject", 1512},
+		{"Message-ID", lenMessageID},
+		{"preview", lenPreview},
+		{"subject", lenSubject},
 		{"+1504", 1504},
-		{"topic", 1684},
+		{"topic", lenTopic},
 		{"+1668", 1668},
 		{"+1500", 1500},
 	}
@@ -186,7 +186,7 @@ func subjectGap(data []byte, w io.Writer) error {
 		if !ok {
 			continue
 		}
-		v := int(binary.LittleEndian.Uint16(it.obj[1512:]))
+		v := int(binary.LittleEndian.Uint16(it.obj[lenSubject:]))
 		match := false
 		for _, x := range s {
 			if len(encodeU16(x))+2 == v {
