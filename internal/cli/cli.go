@@ -28,6 +28,7 @@ const (
 )
 
 type globals struct {
+	envErr     error // a malformed environment variable
 	store      string
 	account    string
 	maxContent int
@@ -49,11 +50,20 @@ func (g *globals) options() service.Options {
 	return service.Options{MaxContent: g.maxContent, Now: time.Now}
 }
 
-func envInt(name string, def int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil {
-		return v
+// envInt reads a whole number 0 or more from the environment variable
+// name; an unset variable gives def. A malformed value is kept in
+// g.envErr and reported before the command runs.
+func (g *globals) envInt(name string, def int) int {
+	raw, set := os.LookupEnv(name)
+	if !set || strings.TrimSpace(raw) == "" {
+		return def
 	}
-	return def
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v < 0 {
+		g.envErr = fmt.Errorf("%w: %s must be a whole number 0 or more", ErrInvalidFlag, name)
+		return def
+	}
+	return v
 }
 
 // NewRootCommand returns the outlookcache command with its subcommands.
@@ -74,15 +84,18 @@ func NewRootCommand(version string, stdout, stderr io.Writer) *cobra.Command {
 	}
 	root.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		g.ctx = cmd.Context()
+		if g.envErr != nil && !cmd.Flags().Changed("max-content") {
+			return g.envErr
+		}
 		return validate(cmd)
 	}
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	flags := root.PersistentFlags()
-	flags.StringVar(&g.store, "store", os.Getenv(envStore), "path to HxStore.hxd (default: the default profile; env "+envStore+")")
+	flags.StringVar(&g.store, "store", "", "path to HxStore.hxd (default: env "+envStore+", else the default profile)")
 	flags.StringVar(&g.account, "account", "", "only this account, by ID or e-mail address (see the accounts command)")
-	flags.IntVar(&g.maxContent, "max-content", envInt(envMaxContent, 4000), "characters of body text in read and thread, 0 for no limit (env "+envMaxContent+")")
-	flags.BoolVarP(&g.verbose, "verbose", "v", false, "log details, such as skipped records, to stderr")
+	flags.IntVar(&g.maxContent, "max-content", g.envInt(envMaxContent, 4000), "characters of body text in read and thread, 0 for no limit (env "+envMaxContent+")")
+	flags.BoolVarP(&g.verbose, "verbose", "v", false, "log load statistics to stderr")
 
 	root.AddCommand(
 		accountsCommand(g),
@@ -119,15 +132,32 @@ func encodeJSON(w io.Writer, out any) error {
 	return nil
 }
 
-// writeJSON prints out and the summary line. unconfirmed < 0 leaves the
-// unconfirmed count out.
-func writeJSON(g *globals, snap *service.Snapshot, count, unconfirmed int, out any) error {
+// summary is the content of the stderr summary line.
+type summary struct {
+	count       int
+	more        bool // the limit cut off further results
+	unconfirmed int  // shown when withUnconfirmed
+	unreadable  int  // bodies a body search could not read
+	withUnconf  bool
+}
+
+// writeJSON prints out and the summary line, for example
+// "# 50 result(s) (limit reached, more exist), 0 record(s) skipped,
+// 0 damaged section(s), 131 undecoded block(s), 12 unconfirmed".
+func writeJSON(g *globals, snap *service.Snapshot, sum summary, out any) error {
 	if err := encodeJSON(g.stdout, out); err != nil {
 		return err
 	}
-	line := fmt.Sprintf("# %d result(s), %d record(s) skipped, %d damaged section(s)", count, snap.Skipped(), snap.Damaged())
-	if unconfirmed >= 0 {
-		line += fmt.Sprintf(", %d unconfirmed", unconfirmed)
+	line := fmt.Sprintf("# %d result(s)", sum.count)
+	if sum.more {
+		line += " (limit reached, more exist)"
+	}
+	line += fmt.Sprintf(", %d record(s) skipped, %d damaged section(s), %d undecoded block(s)", snap.Skipped(), snap.Damaged(), snap.Undecoded())
+	if sum.withUnconf {
+		line += fmt.Sprintf(", %d unconfirmed", sum.unconfirmed)
+	}
+	if sum.unreadable > 0 {
+		line += fmt.Sprintf(", %d body(ies) could not be searched", sum.unreadable)
 	}
 	if _, err := fmt.Fprintln(g.stderr, line); err != nil {
 		return fmt.Errorf("write summary: %w", err)
@@ -136,28 +166,26 @@ func writeJSON(g *globals, snap *service.Snapshot, count, unconfirmed int, out a
 }
 
 func (g *globals) load() (*service.Snapshot, error) {
-	return service.Load(g.ctx, g.store, g.logger())
+	path := g.store
+	if path == "" {
+		path = os.Getenv(envStore)
+	}
+	return service.Load(g.ctx, path, g.logger())
 }
 
-func messageFilterFlags(cmd *cobra.Command, f *service.Filter, defLimit, defDays int) {
-	cmd.Flags().StringVar(&f.Folder, "folder", "", "only this folder, by ID, role (inbox, sent, drafts, deleted, junk, archive, outbox) or name")
+func listSummary(l service.List) summary {
+	return summary{count: len(l.Messages), more: l.More, unconfirmed: l.Unconfirmed(), unreadable: l.UnreadableBodies, withUnconf: true}
+}
+
+func messageFilterFlags(cmd *cobra.Command, f *service.Filter) {
+	cmd.Flags().StringVar(&f.Folder, "folder", "", "only this folder: an ID, else a role (inbox, sent, drafts, deleted, junk, archive, outbox), else a name")
 	cmd.Flags().BoolVar(&f.Unread, "unread", false, "only unread messages")
-	cmd.Flags().IntVar(&f.Days, "days", defDays, "only messages of the last N days, 0 for all")
-	cmd.Flags().IntVar(&f.Limit, "limit", defLimit, limitHelp)
+	cmd.Flags().IntVar(&f.Days, "days", 0, "only messages of the last N days, 0 for all")
+	cmd.Flags().IntVar(&f.Limit, "limit", 50, limitHelp)
 	cmd.Flags().BoolVar(&f.ConfirmedOnly, "confirmed-only", false, "hide messages that may be deleted (confirmed: false)")
 }
 
 const limitHelp = "maximum number of results, 0 for no limit"
-
-func unconfirmed(rows []service.MessageRow) int {
-	n := 0
-	for _, r := range rows {
-		if !r.Confirmed {
-			n++
-		}
-	}
-	return n
-}
 
 func accountsCommand(g *globals) *cobra.Command {
 	return &cobra.Command{
@@ -173,7 +201,7 @@ func accountsCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeJSON(g, snap, len(out), -1, out)
+			return writeJSON(g, snap, summary{count: len(out)}, out)
 		},
 	}
 }
@@ -192,7 +220,11 @@ func foldersCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeJSON(g, snap, len(out), -1, out)
+			sum := summary{count: len(out), withUnconf: true}
+			for _, f := range out {
+				sum.unconfirmed += f.Unconfirmed
+			}
+			return writeJSON(g, snap, sum, out)
 		},
 	}
 }
@@ -213,10 +245,10 @@ func messagesCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeJSON(g, snap, len(out), unconfirmed(out), out)
+			return writeJSON(g, snap, listSummary(out), out.Messages)
 		},
 	}
-	messageFilterFlags(cmd, &f, 50, 0)
+	messageFilterFlags(cmd, &f)
 	return cmd
 }
 
@@ -237,10 +269,10 @@ func searchCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeJSON(g, snap, len(out), unconfirmed(out), out)
+			return writeJSON(g, snap, listSummary(out), out.Messages)
 		},
 	}
-	messageFilterFlags(cmd, &f, 50, 0)
+	messageFilterFlags(cmd, &f)
 	cmd.Flags().BoolVar(&inBody, "body", false, "also search the body text (reads every body, slower)")
 	return cmd
 }
@@ -258,15 +290,15 @@ func readCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := snap.Message(g.ctx, args[0], quoted, g.options())
+			out, err := snap.Message(g.ctx, args[0], g.account, quoted, g.options())
 			if err != nil {
 				return err
 			}
-			n := 0
+			sum := summary{count: 1, withUnconf: true}
 			if !out.Confirmed {
-				n = 1
+				sum.unconfirmed = 1
 			}
-			return writeJSON(g, snap, 1, n, out)
+			return writeJSON(g, snap, sum, out)
 		},
 	}
 	cmd.Flags().BoolVar(&quoted, "quoted", false, "keep quoted and forwarded text")
@@ -285,17 +317,17 @@ func threadCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out, err := snap.Thread(g.ctx, args[0], quoted, limit, g.options())
+			out, more, err := snap.Thread(g.ctx, args[0], g.account, quoted, limit, g.options())
 			if err != nil {
 				return err
 			}
-			n := 0
+			sum := summary{count: len(out), more: more, withUnconf: true}
 			for _, m := range out {
 				if !m.Confirmed {
-					n++
+					sum.unconfirmed++
 				}
 			}
-			return writeJSON(g, snap, len(out), n, out)
+			return writeJSON(g, snap, sum, out)
 		},
 	}
 	cmd.Flags().BoolVar(&quoted, "quoted", false, "keep quoted and forwarded text")

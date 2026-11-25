@@ -1,6 +1,6 @@
 // Package service answers questions about the Outlook store: accounts,
 // folders, message lists, searches, single messages with their bodies and
-// threads. The CLI and the MCP server both use it.
+// threads. The CLI uses it.
 package service
 
 import (
@@ -12,9 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stn1slv/outlookcache/internal/body"
 	"github.com/stn1slv/outlookcache/internal/snapshot"
@@ -22,13 +22,19 @@ import (
 )
 
 var (
-	// ErrStoreMissing reports that HxStore.hxd was not found or cannot be
-	// read.
+	// ErrStoreMissing reports that HxStore.hxd does not exist.
 	ErrStoreMissing = errors.New("outlook store not found")
+	// ErrStoreAccess reports that HxStore.hxd exists but cannot be read.
+	ErrStoreAccess = errors.New("outlook store cannot be read")
 	// ErrNotFound reports an unknown account, folder, message or
 	// conversation.
 	ErrNotFound = errors.New("not found")
+	// ErrInvalidArgument reports an argument the service does not accept.
+	ErrInvalidArgument = errors.New("invalid argument")
 )
+
+// accessHint explains the usual cause of a permission error on macOS.
+const accessHint = "the terminal app may need Full Disk Access, or access to the Outlook data folder, in System Settings > Privacy & Security"
 
 // storeRel is the store path of the default profile, relative to the home
 // folder (new Outlook for Mac).
@@ -48,7 +54,7 @@ type Options struct {
 	// MaxContent is the maximum number of characters of body text; 0
 	// means no limit.
 	MaxContent int
-	// Now returns the current time (for --days); nil means time.Now.
+	// Now returns the current time (for Filter.Days); nil means time.Now.
 	Now func() time.Time
 }
 
@@ -57,6 +63,13 @@ func (o Options) now() time.Time {
 		return time.Now()
 	}
 	return o.Now()
+}
+
+func (o Options) validate() error {
+	if o.MaxContent < 0 {
+		return fmt.Errorf("%w: max content must be 0 or more", ErrInvalidArgument)
+	}
+	return nil
 }
 
 // Snapshot is the decoded content of one copy of the store.
@@ -70,8 +83,12 @@ type Snapshot struct {
 
 // Load copies the store at path (the default profile when path is "") into
 // a private temporary folder, reads the copy into memory, removes the copy
-// and decodes it. The original file is only opened for reading.
+// and decodes it. The original file is only opened for reading. A nil
+// logger logs nothing.
 func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, error) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	if path == "" {
 		p, err := DefaultStorePath()
 		if err != nil {
@@ -80,13 +97,13 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, err
 		path = p
 	}
 	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("%w at %s (is new Outlook for Mac installed? use --store to choose a file)", ErrStoreMissing, path)
-		}
-		return nil, fmt.Errorf("%w: %w (the terminal may need access to the Outlook data folder)", ErrStoreMissing, err)
+		return nil, storeError(path, err)
 	}
 	data, err := copyAndRead(ctx, path)
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) {
+			return nil, storeError(path, err)
+		}
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -96,9 +113,14 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, err
 	if err != nil {
 		return nil, err
 	}
+	st := s.Stats
 	logger.Debug("store loaded", "messages", len(s.Messages), "folders", len(s.Folders), "accounts", len(s.Accounts),
-		"skipped_records", s.Stats.SkippedRecords, "damaged_sections", len(s.Stats.Damage),
-		"unconfirmed", s.Stats.Unconfirmed, "undecoded_blocks", s.Stats.UndecodedBlocks)
+		"skipped_records", st.SkippedRecords, "damaged_sections", len(st.Damage), "unindexed_damaged", st.UnindexedDamaged,
+		"undecoded_blocks", st.UndecodedBlocks, "unconfirmed", st.Unconfirmed, "ambiguous", st.Ambiguous,
+		"index_unreadable", st.IndexUnreadable, "index_areas_differ", st.IndexAreasDiffer)
+	if st.IndexUnreadable {
+		logger.Warn("the block index has an unexpected layout; every message is marked unconfirmed")
+	}
 	snap := &Snapshot{Store: s, Profile: filepath.Dir(path), folders: map[string]store.Folder{}}
 	for _, f := range s.Folders {
 		snap.folders[f.ID] = f
@@ -106,17 +128,28 @@ func Load(ctx context.Context, path string, logger *slog.Logger) (*Snapshot, err
 	return snap, nil
 }
 
+func storeError(path string, err error) error {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("%w at %s (is new Outlook for Mac installed and signed in?)", ErrStoreMissing, path)
+	case errors.Is(err, fs.ErrPermission):
+		return fmt.Errorf("%w: %w (%s)", ErrStoreAccess, err, accessHint)
+	default:
+		return fmt.Errorf("%w: %w", ErrStoreAccess, err)
+	}
+}
+
 func copyAndRead(ctx context.Context, path string) (data []byte, err error) {
-	snap, err := snapshot.New()
+	tmp, err := snapshot.New()
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if cerr := snap.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("remove snapshot: %w", cerr)
+		if cerr := tmp.Close(); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("remove temporary copy: %w", cerr))
 		}
 	}()
-	cp, err := snap.Copy(ctx, path)
+	cp, err := tmp.Copy(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +162,10 @@ func (s *Snapshot) Skipped() int { return s.Store.Stats.SkippedRecords }
 // Damaged is the number of damaged sections that the index points at.
 func (s *Snapshot) Damaged() int { return len(s.Store.Stats.Damage) }
 
+// Undecoded is the number of blocks in a format the reader cannot read
+// (type 16, see docs/STORAGE.md).
+func (s *Snapshot) Undecoded() int { return s.Store.Stats.UndecodedBlocks }
+
 // MessageRow is a message with the name and role of its folder.
 type MessageRow struct {
 	store.Message
@@ -136,21 +173,51 @@ type MessageRow struct {
 	FolderRole string `json:"folder_role,omitempty"`
 }
 
-// FolderRow is a folder with message counts.
+// FolderRow is a folder with message counts. Unconfirmed messages are
+// included in Total and Unread and also counted on their own.
 type FolderRow struct {
 	store.Folder
-	Total  int `json:"total"`
-	Unread int `json:"unread"`
+	Total       int `json:"total"`
+	Unread      int `json:"unread"`
+	Unconfirmed int `json:"unconfirmed"`
 }
 
 // Filter selects messages. Empty fields select everything.
 type Filter struct {
 	Account       string // account ID or address
-	Folder        string // folder ID, role (inbox, sent, ...) or name, ignoring case
+	Folder        string // folder ID, else role (inbox, sent, ...), else name; ignoring case
 	Unread        bool   // only unread messages
 	Days          int    // only messages received in the last N days
 	Limit         int    // maximum number of results, 0 for no limit
 	ConfirmedOnly bool   // only messages whose copy is in a direct index slot
+}
+
+func (f Filter) validate() error {
+	if f.Days < 0 || f.Limit < 0 {
+		return fmt.Errorf("%w: days and limit must be 0 or more", ErrInvalidArgument)
+	}
+	return nil
+}
+
+// List is a list of messages.
+type List struct {
+	Messages []MessageRow
+	// More is true when the limit cut off further matches.
+	More bool
+	// UnreadableBodies counts bodies a body search could not read; those
+	// messages may match but are not listed.
+	UnreadableBodies int
+}
+
+// Unconfirmed counts the listed messages that may be deleted.
+func (l List) Unconfirmed() int {
+	n := 0
+	for _, m := range l.Messages {
+		if !m.Confirmed {
+			n++
+		}
+	}
+	return n
 }
 
 // Accounts returns the accounts, or the one that account names.
@@ -168,17 +235,19 @@ func (s *Snapshot) Accounts(account string) ([]store.Account, error) {
 	return out, nil
 }
 
-// accountID resolves an account ID or address; "" stays "".
+// accountID resolves an account ID or address; "" stays "". The error
+// does not repeat the value, so an address is never printed.
 func (s *Snapshot) accountID(account string) (string, error) {
 	if account == "" {
 		return "", nil
 	}
+	want := strings.ToLower(account)
 	for _, a := range s.Store.Accounts {
-		if a.ID == strings.ToLower(account) || a.Address != "" && strings.EqualFold(a.Address, account) {
+		if a.ID == want || a.Address != "" && strings.EqualFold(a.Address, account) {
 			return a.ID, nil
 		}
 	}
-	return "", fmt.Errorf("%w: account %q", ErrNotFound, account)
+	return "", fmt.Errorf("%w: no account with this ID or address (see the accounts command)", ErrNotFound)
 }
 
 // Folders returns the folders of all accounts or of one, with message
@@ -188,11 +257,17 @@ func (s *Snapshot) Folders(ctx context.Context, account string) ([]FolderRow, er
 	if err != nil {
 		return nil, err
 	}
-	total, unread := map[string]int{}, map[string]int{}
+	total, unread, unconfirmed := map[string]int{}, map[string]int{}, map[string]int{}
 	for _, m := range s.Store.Messages {
+		if id != "" && m.AccountID != id {
+			continue
+		}
 		total[m.FolderID]++
 		if !m.Read {
 			unread[m.FolderID]++
+		}
+		if !m.Confirmed {
+			unconfirmed[m.FolderID]++
 		}
 	}
 	out := []FolderRow{}
@@ -201,32 +276,40 @@ func (s *Snapshot) Folders(ctx context.Context, account string) ([]FolderRow, er
 			return nil, err
 		}
 		if id == "" || f.AccountID == id {
-			out = append(out, FolderRow{Folder: f, Total: total[f.ID], Unread: unread[f.ID]})
+			out = append(out, FolderRow{Folder: f, Total: total[f.ID], Unread: unread[f.ID], Unconfirmed: unconfirmed[f.ID]})
 		}
 	}
 	return out, nil
 }
 
-// folderIDs resolves a folder ID, role or name to the matching folder IDs
-// of the account (all accounts when accountID is "").
+// folderIDs resolves a folder of the account (all accounts when accountID
+// is ""): a folder ID wins over a role, and a role over a name. The error
+// does not repeat the value.
 func (s *Snapshot) folderIDs(folder, accountID string) (map[string]bool, error) {
 	if folder == "" {
 		return nil, nil
 	}
 	want := strings.ToLower(folder)
-	out := map[string]bool{}
+	byID, byRole, byName := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, f := range s.Store.Folders {
 		if accountID != "" && f.AccountID != accountID {
 			continue
 		}
-		if f.ID == want || f.Role == want || strings.EqualFold(f.Name, folder) {
-			out[f.ID] = true
+		switch {
+		case f.ID == want:
+			byID[f.ID] = true
+		case f.Role != "" && f.Role == want:
+			byRole[f.ID] = true
+		case strings.EqualFold(f.Name, folder):
+			byName[f.ID] = true
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: folder %q", ErrNotFound, folder)
+	for _, set := range []map[string]bool{byID, byRole, byName} {
+		if len(set) > 0 {
+			return set, nil
+		}
 	}
-	return out, nil
+	return nil, fmt.Errorf("%w: no folder with this ID, role or name (see the folders command)", ErrNotFound)
 }
 
 func (s *Snapshot) row(m store.Message) MessageRow {
@@ -245,25 +328,43 @@ func when(m store.Message) time.Time {
 	return time.Time{}
 }
 
-// selectMessages applies the filter and match, newest first.
-func (s *Snapshot) selectMessages(ctx context.Context, f Filter, opts Options, match func(store.Message) (bool, error)) ([]MessageRow, error) {
+// newer orders messages newest first; equal times by ID, as numbers.
+func newer(a, b store.Message) bool {
+	ta, tb := when(a), when(b)
+	if !ta.Equal(tb) {
+		return ta.After(tb)
+	}
+	if len(a.ID) != len(b.ID) {
+		return len(a.ID) > len(b.ID)
+	}
+	return a.ID > b.ID
+}
+
+// matcher decides whether a message matches; unreadable is true when the
+// message could not be checked.
+type matcher func(store.Message) (ok, unreadable bool)
+
+// selectMessages applies the filter, sorts newest first and then runs
+// match in that order until the limit is reached, so a costly match runs
+// only as often as needed.
+func (s *Snapshot) selectMessages(ctx context.Context, f Filter, opts Options, match matcher) (List, error) {
+	if err := f.validate(); err != nil {
+		return List{}, err
+	}
 	accountID, err := s.accountID(f.Account)
 	if err != nil {
-		return nil, err
+		return List{}, err
 	}
 	folders, err := s.folderIDs(f.Folder, accountID)
 	if err != nil {
-		return nil, err
+		return List{}, err
 	}
 	var since time.Time
 	if f.Days > 0 {
-		since = opts.now().Add(-time.Duration(f.Days) * 24 * time.Hour)
+		since = opts.now().AddDate(0, 0, -f.Days)
 	}
-	var picked []store.Message
+	var candidates []store.Message
 	for _, m := range s.Store.Messages {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		switch {
 		case accountID != "" && m.AccountID != accountID,
 			folders != nil && !folders[m.FolderID],
@@ -272,61 +373,60 @@ func (s *Snapshot) selectMessages(ctx context.Context, f Filter, opts Options, m
 			f.Days > 0 && when(m).Before(since):
 			continue
 		}
+		candidates = append(candidates, m)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return newer(candidates[i], candidates[j]) })
+	out := List{Messages: []MessageRow{}}
+	for _, m := range candidates {
+		if err := ctx.Err(); err != nil {
+			return List{}, err
+		}
 		if match != nil {
-			ok, err := match(m)
-			if err != nil {
-				return nil, err
+			ok, unreadable := match(m)
+			if unreadable {
+				out.UnreadableBodies++
 			}
 			if !ok {
 				continue
 			}
 		}
-		picked = append(picked, m)
-	}
-	sort.SliceStable(picked, func(i, j int) bool {
-		a, b := when(picked[i]), when(picked[j])
-		if !a.Equal(b) {
-			return a.After(b)
+		if f.Limit > 0 && len(out.Messages) == f.Limit {
+			out.More = true
+			break
 		}
-		return picked[i].ID > picked[j].ID
-	})
-	if f.Limit > 0 && len(picked) > f.Limit {
-		picked = picked[:f.Limit]
-	}
-	out := make([]MessageRow, 0, len(picked))
-	for _, m := range picked {
-		out = append(out, s.row(m))
+		out.Messages = append(out.Messages, s.row(m))
 	}
 	return out, nil
 }
 
 // Messages returns the messages that the filter selects, newest first.
-func (s *Snapshot) Messages(ctx context.Context, f Filter, opts Options) ([]MessageRow, error) {
+func (s *Snapshot) Messages(ctx context.Context, f Filter, opts Options) (List, error) {
 	return s.selectMessages(ctx, f, opts, nil)
 }
 
 // Search returns messages whose subject, preview, sender, recipients or
 // attachment names contain query, ignoring case. With inBody it also
-// searches the body text, which reads every body and is slower.
-func (s *Snapshot) Search(ctx context.Context, query string, inBody bool, f Filter, opts Options) ([]MessageRow, error) {
+// searches the body text (quoted text included), which reads bodies and
+// is slower; bodies that cannot be read are counted in the result.
+func (s *Snapshot) Search(ctx context.Context, query string, inBody bool, f Filter, opts Options) (List, error) {
 	q := strings.ToLower(strings.TrimSpace(query))
 	if q == "" {
-		return nil, fmt.Errorf("%w: empty search text", ErrInvalidArgument)
+		return List{}, fmt.Errorf("%w: empty search text", ErrInvalidArgument)
 	}
-	return s.selectMessages(ctx, f, opts, func(m store.Message) (bool, error) {
+	return s.selectMessages(ctx, f, opts, func(m store.Message) (bool, bool) {
 		if strings.Contains(strings.ToLower(headerText(m)), q) {
-			return true, nil
+			return true, false
 		}
 		if !inBody {
-			return false, nil
+			return false, false
 		}
 		b := s.body(m, true, 0)
-		return strings.Contains(strings.ToLower(b.Text), q), nil
+		if b.Error != "" || b.Kind == store.BodyUnparsed {
+			return false, true
+		}
+		return strings.Contains(strings.ToLower(b.Text), q), false
 	})
 }
-
-// ErrInvalidArgument reports an argument the service does not accept.
-var ErrInvalidArgument = errors.New("invalid argument")
 
 func headerText(m store.Message) string {
 	parts := []string{m.Subject, m.Preview}
@@ -390,45 +490,88 @@ func (s *Snapshot) body(m store.Message, quoted bool, maxContent int) Body {
 		t = body.ToText(doc, false)
 	}
 	b.Text, b.QuoteRemoved = t.Text, t.QuoteRemoved
-	if maxContent > 0 && utf8.RuneCountInString(b.Text) > maxContent {
-		b.Text, b.Truncated = string([]rune(b.Text)[:maxContent]), true
-	}
+	b.Text, b.Truncated = truncate(b.Text, maxContent)
 	return b
 }
 
-// Message returns one message with its body. With quoted, quoted and
-// forwarded text is kept.
-func (s *Snapshot) Message(ctx context.Context, id string, quoted bool, opts Options) (MessageDetail, error) {
+// truncate cuts s after max characters; max 0 means no limit.
+func truncate(s string, maxChars int) (string, bool) {
+	if maxChars <= 0 {
+		return s, false
+	}
+	n := 0
+	for i := range s {
+		if n == maxChars {
+			return s[:i], true
+		}
+		n++
+	}
+	return s, false
+}
+
+// canonID returns the store form of a hexadecimal ID (lower case, no
+// leading zeros, an optional 0x prefix removed).
+func canonID(id string) (string, bool) {
+	v, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(id)), "0x"), 16, 64)
+	if err != nil || v == 0 {
+		return "", false
+	}
+	return strconv.FormatUint(v, 16), true
+}
+
+// Message returns one message with its body. With account, the message
+// must belong to that account. With quoted, quoted and forwarded text is
+// kept.
+func (s *Snapshot) Message(ctx context.Context, id, account string, quoted bool, opts Options) (MessageDetail, error) {
 	if err := ctx.Err(); err != nil {
 		return MessageDetail{}, err
 	}
-	for _, m := range s.Store.Messages {
-		if m.ID == strings.ToLower(id) {
-			return MessageDetail{MessageRow: s.row(m), Body: s.body(m, quoted, opts.MaxContent)}, nil
+	if err := opts.validate(); err != nil {
+		return MessageDetail{}, err
+	}
+	accountID, err := s.accountID(account)
+	if err != nil {
+		return MessageDetail{}, err
+	}
+	want, ok := canonID(id)
+	if ok {
+		for _, m := range s.Store.Messages {
+			if m.ID == want && (accountID == "" || m.AccountID == accountID) {
+				return MessageDetail{MessageRow: s.row(m), Body: s.body(m, quoted, opts.MaxContent)}, nil
+			}
 		}
 	}
 	return MessageDetail{}, fmt.Errorf("%w: message %q", ErrNotFound, id)
 }
 
 // Thread returns the messages of a conversation with their bodies, oldest
-// first; with limit > 0 only the newest limit messages.
-func (s *Snapshot) Thread(ctx context.Context, conversationID string, quoted bool, limit int, opts Options) ([]MessageDetail, error) {
-	id := strings.ToLower(conversationID)
-	rows, err := s.selectMessages(ctx, Filter{Limit: limit}, opts, func(m store.Message) (bool, error) {
-		return id != "" && m.ConversationID == id, nil
+// first; with limit > 0 only the newest limit messages, and more is true
+// when older ones were left out. With account, only that account's
+// messages are included.
+func (s *Snapshot) Thread(ctx context.Context, conversationID, account string, quoted bool, limit int, opts Options) (out []MessageDetail, more bool, err error) {
+	if err := opts.validate(); err != nil {
+		return nil, false, err
+	}
+	id, ok := canonID(conversationID)
+	if !ok {
+		return nil, false, fmt.Errorf("%w: conversation %q", ErrNotFound, conversationID)
+	}
+	list, err := s.selectMessages(ctx, Filter{Account: account, Limit: limit}, opts, func(m store.Message) (bool, bool) {
+		return m.ConversationID == id, false
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if len(rows) == 0 {
-		return nil, fmt.Errorf("%w: conversation %q", ErrNotFound, conversationID)
+	if len(list.Messages) == 0 {
+		return nil, false, fmt.Errorf("%w: conversation %q", ErrNotFound, conversationID)
 	}
-	out := make([]MessageDetail, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
+	out = make([]MessageDetail, 0, len(list.Messages))
+	for i := len(list.Messages) - 1; i >= 0; i-- {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		out = append(out, MessageDetail{MessageRow: rows[i], Body: s.body(rows[i].Message, quoted, opts.MaxContent)})
+		row := list.Messages[i]
+		out = append(out, MessageDetail{MessageRow: row, Body: s.body(row.Message, quoted, opts.MaxContent)})
 	}
-	return out, nil
+	return out, list.More, nil
 }
