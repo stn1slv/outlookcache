@@ -43,8 +43,10 @@ changelog:
   sort: asc
   filters:
     exclude:
-      - '^docs:'
-      - '^test:'
+      - '^docs(\(.+\))?:'
+      - '^test(\(.+\))?:'
+      - '^ci(\(.+\))?:'
+      - '^chore(\(.+\))?:'
 
 homebrew_casks:
   - name: outlookcache
@@ -54,7 +56,7 @@ homebrew_casks:
       owner: stn1slv
       name: homebrew-tap
       # A custom token is needed to push to a different repository
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      token: '{{ index .Env "TAP_GITHUB_TOKEN" }}'
     directory: Casks
     # Skip the tap until the TAP_GITHUB_TOKEN secret is set, so a release
     # without it still succeeds.

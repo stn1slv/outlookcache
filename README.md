@@ -16,9 +16,9 @@ With Homebrew on macOS:
 brew install --cask stn1slv/tap/outlookcache
 ```
 
-Binaries for macOS (Apple silicon and Intel) are on the [releases page](https://github.com/stn1slv/outlookcache/releases). The binaries are not signed. If macOS blocks a downloaded binary, run `xattr -d com.apple.quarantine outlookcache`.
+Binaries for macOS (Apple silicon and Intel) are on the [releases page](https://github.com/stn1slv/outlookcache/releases). The binaries are not signed. The Homebrew cask removes the macOS quarantine flag after install, so macOS does not block the binary. If macOS blocks a binary you downloaded yourself, run `xattr -d com.apple.quarantine outlookcache`.
 
-With Go 1.27 or later:
+With Go 1.27.4 or later:
 
 ```bash
 go install github.com/stn1slv/outlookcache/cmd/outlookcache@latest
@@ -40,12 +40,12 @@ outlookcache messages --days 7                # messages of the last 7 days
 outlookcache search "quarterly budget"        # text in subject, preview, sender, recipients or attachment names
 outlookcache search "budget" --body           # also search the body text (slower)
 outlookcache read 18800001                    # one message with its body as plain text
-outlookcache thread 18800101                  # all messages of a conversation, oldest first
+outlookcache thread 18800101                  # messages of a conversation, oldest first (the newest 20 by default)
 ```
 
 `messages` and `search` print messages without bodies. Use the `id` of a row with `read`, and its `conversation_id` with `thread`. By default `read` and `thread` cut off quoted and forwarded text, so each message shows only its new text; `--quoted` keeps it.
 
-All commands print JSON to stdout and a summary to stderr, for example `# 12 result(s), 3 record(s) skipped, 0 damaged section(s), 123 undecoded block(s), 2 unconfirmed`. The counts are explained in [Honest output](#honest-output).
+These commands print JSON to stdout and a summary to stderr, for example `# 12 result(s), 3 record(s) skipped, 0 damaged section(s), 123 undecoded block(s), 2 unconfirmed`. The values are explained in [Honest output](#honest-output).
 
 ### Flags and defaults
 
@@ -90,7 +90,7 @@ The default store is `~/Library/Group Containers/UBF8T346G9.Office/Outlook/Outlo
 }
 ```
 
-Add `"--account", "you@example.com"` to the arguments to serve only one account, or `"--max-content", "0"` for full body text.
+To serve only one account, use `"args": ["mcp", "--account", "you@example.com"]`. Add `"--max-content", "0"` for full body text. If the app does not find `outlookcache`, put the full path from `which outlookcache` in `command`, because apps started from the Dock often do not have the Homebrew folder in their `PATH`.
 
 | Tool | Purpose | Key arguments and defaults |
 |------|---------|----------------------------|
@@ -103,27 +103,30 @@ Add `"--account", "you@example.com"` to the arguments to serve only one account,
 
 The server decodes the store on the first tool call and keeps it in memory. It decodes the store again when the TTL ends or when Outlook changes the file.
 
-Every tool response keeps its rows in `result`. It also has `more` (the limit cut off more matches), the counts described in [Honest output](#honest-output), `partial` and `content_trust`.
+Every tool response keeps its rows in `result`. It also has `more` (the limit cut off more matches), the values described in [Honest output](#honest-output), `partial` and `content_trust`.
 
 Mail is written by other people, so an AI assistant must not follow instructions found in it. Every tool description, the server instructions and the `content_trust` field of every response say so.
 
 ## Honest output
 
-`outlookcache` reads an undocumented file format, so it reports what it could not read instead of hiding it:
+`outlookcache` reads an undocumented file format, so it reports what it could not read instead of hiding it.
 
-| Field | Meaning |
-|-------|---------|
-| `confirmed` | `true` when the block index of the store confirms the message. Messages with `false` may already be deleted, because the reader cannot yet tell all deleted messages from live ones. `--confirmed-only` (MCP: `confirmed_only`) hides them. |
-| `skipped_records` | Messages that could not be decoded. |
-| `damaged_sections` | Blocks in the index that fail their checksum. |
-| `unindexed_damaged` | Failing blocks without an index entry. Most are old copies. |
-| `undecoded_blocks` | Blocks in a format the reader does not know yet. They may hold recent changes. |
-| `unreadable_bodies` | Bodies that could not be read, for example a missing EFMData file. |
-| `partial` | MCP only: `true` when any of the counts above is not zero, so a result may be incomplete. |
+Every message has a `confirmed` field. It is `true` when the block index of the store confirms the message. Messages with `false` may already be deleted, because the reader cannot yet tell all deleted messages from live ones. `--confirmed-only` (MCP: `confirmed_only`) hides them.
 
-On a real store, `undecoded_blocks` is usually not zero, so `partial` is usually `true`. An empty result then does not prove that no matching message exists.
+The CLI shows the other values in the summary line on stderr. The MCP server returns them as fields of every response.
 
-The body of a message has a `kind`: `inline` (stored in the store), `efmdata` (stored in a separate file below `Files/S0/<n>/EFMData`), `none` (only the preview is stored, as for most meeting items) or `unparsed` (a layout the reader does not know).
+| Value | CLI summary | MCP field | Meaning |
+|-------|-------------|-----------|---------|
+| Unconfirmed messages | `N unconfirmed` | `unconfirmed` | Messages in the result with `confirmed: false`. |
+| Skipped records | `N record(s) skipped` | `skipped_records` | Messages that could not be decoded. |
+| Damaged sections | `N damaged section(s)` | `damaged_sections` | Blocks in the index that fail their checksum. In MCP this is a list with the `file`, `offset`, `length`, `reason` and `block_type` of each block. |
+| Unindexed damaged blocks | only in the `-v` log | `unindexed_damaged` | Failing blocks without an index entry. Most are old copies. |
+| Undecoded blocks | `N undecoded block(s)` | `undecoded_blocks` | Blocks in a format the reader does not know yet. They may hold recent changes. |
+| Unreadable bodies | `N body(ies) could not be searched` (`search --body`) | `unreadable_bodies` | Bodies that could not be read, for example because an EFMData file is missing. `read` and `thread` show the reason in `body.error`. |
+
+In MCP, `partial` is `true` when any of these values except `unconfirmed` is not zero, or when the block index cannot be read. The result may then be incomplete. On a real store, `undecoded_blocks` is usually not zero, so `partial` is usually `true`, and an empty result does not prove that no matching message exists.
+
+The body of a message has a `kind`: `inline` (stored in the store), `efmdata` (stored in a separate file below `Files/S0/<n>/EFMData`), `none` (only the preview is stored) or `unparsed` (a layout the reader does not know).
 
 ## How it works
 
@@ -152,6 +155,7 @@ make lint         # golangci-lint and gofumpt
 make format       # format the code
 make build        # build bin/outlookcache
 make vulncheck    # check for known vulnerabilities
+make nonet        # check that no package imports network code
 make upgrade-deps # update dependencies and pinned Go tools
 ```
 

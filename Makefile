@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CMD := outlookcache
 BIN := bin/$(CMD)
 
-.PHONY: setup test lint format build run clean upgrade-deps vulncheck
+.PHONY: setup test lint format build run clean upgrade-deps vulncheck nonet
 
 setup: ## Download dependencies and tools
 	go mod download
@@ -20,6 +20,9 @@ lint: ## Run the linters and check formatting
 
 vulncheck: ## Check for known vulnerabilities
 	go tool govulncheck ./...
+
+nonet: ## Check that no package of this project imports network code
+	./scripts/check-no-network.sh
 
 format: ## Format the code
 	go tool gofumpt -extra -w .
