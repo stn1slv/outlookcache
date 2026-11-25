@@ -297,6 +297,8 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			return err
 		}
 		cmd = func(data []byte) error { return itemCheck(data, show, m, w) }
+	case "fields":
+		cmd = func(data []byte) error { return fieldCheck(data, now, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":
