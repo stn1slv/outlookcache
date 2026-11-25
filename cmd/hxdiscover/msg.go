@@ -135,36 +135,36 @@ func (li liveIndex) indexed(blockOff int64, area int) bool {
 	return blockOff >= 0 && blockOff%256 == 0 && blockOff/256 <= int64(^uint32(0)) && li.areas[area][uint32(blockOff/256)]
 }
 
-// current picks the current copy of one message: the indexed copy (area
-// A); when no copy is indexed, the copy with the highest stamp. ambiguous
-// is true when the choice rests on a stamp tie between copies that differ
-// in status or folder, or when more than one copy is indexed.
-func (li liveIndex) current(cs []c7copy) (c c7copy, indexed, ambiguous bool) {
-	var hits []c7copy
+// current picks the current copy of one object: the copy with the highest
+// stamp; among copies with that stamp, one in a direct index slot (area A)
+// wins. confirmed is true when the chosen copy is in a direct slot.
+// ambiguous is true when copies with the highest stamp differ in status
+// or folder and the index does not pick exactly one of them.
+func (li liveIndex) current(cs []c7copy) (c c7copy, confirmed, ambiguous bool) {
+	top := cs[0]
 	for _, x := range cs {
-		if li.indexed(x.block, 0) {
-			hits = append(hits, x)
-		}
-	}
-	if len(hits) == 1 {
-		return hits[0], true, false
-	}
-	pool := cs
-	if len(hits) > 1 {
-		pool = hits
-	}
-	top := pool[0]
-	for _, x := range pool {
 		if x.stamp > top.stamp {
 			top = x
 		}
 	}
-	for _, x := range pool {
-		if x.stamp == top.stamp && (x.status != top.status || x.folder != top.folder) {
+	var tied, tiedIndexed []c7copy
+	for _, x := range cs {
+		if x.stamp == top.stamp {
+			tied = append(tied, x)
+			if li.indexed(x.block, 0) {
+				tiedIndexed = append(tiedIndexed, x)
+			}
+		}
+	}
+	if len(tiedIndexed) == 1 {
+		return tiedIndexed[0], true, false
+	}
+	for _, x := range tied {
+		if x.status != top.status || x.folder != top.folder {
 			ambiguous = true
 		}
 	}
-	return top, len(hits) > 1, ambiguous || len(hits) > 1
+	return top, len(tiedIndexed) > 1, ambiguous
 }
 
 // keyFilter selects blocks by key; the zero value selects all blocks.

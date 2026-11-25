@@ -128,19 +128,26 @@ func TestReadLiveIndexRejectsBadHeader(t *testing.T) {
 
 func TestCurrentCopyRule(t *testing.T) {
 	t.Parallel()
-	li := liveIndex{areas: [2]map[uint32]bool{{0x30: true}, {}}}
+	li := liveIndex{areas: [2]map[uint32]bool{{0x30: true, 0x50: true}, {}}}
 	indexed := c7copy{block: 0x3000, stamp: 1, status: 0x82}
 	newer := c7copy{block: 0x4000, stamp: 2, status: 0x80}
-	c, ok, amb := li.current([]c7copy{newer, indexed})
-	assert.Equal(t, indexed, c)
+	c, ok, amb := li.current([]c7copy{indexed, newer})
+	assert.Equal(t, newer, c, "a newer unindexed copy wins (index lag)")
+	assert.False(t, ok)
+	assert.False(t, amb)
+
+	tieIndexed := c7copy{block: 0x5000, stamp: 3, status: 0x82}
+	tieOther := c7copy{block: 0x6000, stamp: 3, status: 0x80}
+	c, ok, amb = li.current([]c7copy{tieOther, tieIndexed})
+	assert.Equal(t, tieIndexed, c, "the index breaks a stamp tie")
 	assert.True(t, ok)
 	assert.False(t, amb)
 
-	tieA := c7copy{block: 0x5000, stamp: 3, status: 0x80}
-	tieB := c7copy{block: 0x6000, stamp: 3, status: 0x82}
+	tieA := c7copy{block: 0x7000, stamp: 4, status: 0x80}
+	tieB := c7copy{block: 0x8000, stamp: 4, status: 0x82}
 	_, ok, amb = li.current([]c7copy{tieA, tieB})
 	assert.False(t, ok)
-	assert.True(t, amb, "same stamp, different read state")
+	assert.True(t, amb, "same stamp, different read state, no index help")
 }
 
 func TestTextUnit(t *testing.T) {

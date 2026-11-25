@@ -124,6 +124,21 @@ func itemCheck(data []byte, show uint64, marker string, w io.Writer) error {
 			noConv++
 		}
 		conv[c.conv]++
+		if indexed {
+			var newest c7copy
+			for _, x := range cs {
+				if x.stamp > newest.stamp {
+					newest = x
+				}
+			}
+			if newest.stamp > c.stamp {
+				lag := "older than checkpoint"
+				if newest.stamp >= ckpt {
+					lag = "at or after checkpoint"
+				}
+				rule["indexed copy is older than an unindexed copy, newer copy "+lag]++
+			}
+		}
 		drop := ckpt != 0 && !indexed && c.stamp < ckpt
 		if drop {
 			dropped++
