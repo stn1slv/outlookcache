@@ -80,7 +80,7 @@ func check(data []byte, w io.Writer) error {
 			continue
 		}
 		h := data[d.Offset : d.Offset+0x28]
-		types[fmt.Sprintf("type=%d %s", binary.LittleEndian.Uint32(h[0x10:]), d.Reason)]++
+		types[fmt.Sprintf("type=%d %s indexed=%t", binary.LittleEndian.Uint32(h[0x10:]), d.Reason, li.indexed(d.Offset, 0))]++
 	}
 	_, _ = fmt.Fprintf(w, "valid=%d\n", st.Valid)
 	printCounts(w, "failing blocks", types)
