@@ -55,8 +55,9 @@ homebrew_casks:
     repository:
       owner: stn1slv
       name: homebrew-tap
-      # A custom token is needed to push to a different repository
-      token: '{{ index .Env "TAP_GITHUB_TOKEN" }}'
+      # A custom token is needed to push to a different repository. GoReleaser
+      # accepts only the plain {{ .Env.NAME }} form here.
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
     directory: Casks
     # Skip the tap until the TAP_GITHUB_TOKEN secret is set, so a release
     # without it still succeeds.
