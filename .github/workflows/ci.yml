@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and vet (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # The binary is built for macOS only, so vet that build too. The code
+      # is pure Go and cross-checks from Linux.
+      - name: go vet (darwin)
+        run: go vet ./...
+        env:
+          GOOS: darwin
+
+      # golangci-lint is pinned as a tool in go.mod, so it is built with the
+      # same Go version as the project.
+      - name: golangci-lint
+        run: go tool golangci-lint run --timeout=5m ./...
+
+      - name: gofumpt
+        run: test -z "$(go tool gofumpt -extra -l .)" || (go tool gofumpt -extra -l . && exit 1)
+
+      - name: go mod tidy
+        run: go mod tidy -diff
+
+      # The tool must never talk to the network. The MCP SDK links net/http,
+      # so check the imports of this project's own packages instead.
+      - name: No network code
+        run: |
+          if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./cmd/... ./internal/... | grep -E ' (net|net/[a-z/]+|crypto/tls)( |$)'; then
+            echo "A package of this project imports a network package."
+            exit 1
+          fi
+
+      - name: govulncheck
+        run: go tool govulncheck ./...
+
+  test-ubuntu:
+    name: Tests (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      # The fixture writer and the discovery tool are for development only.
+      - name: Check coverage
+        run: |
+          grep -v -e '/internal/hxtest/' -e '/cmd/hxdiscover/' coverage.out > coverage-prod.out
+          total=$(go tool cover -func=coverage-prod.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          echo "Total coverage (excluding hxtest and hxdiscover): ${total}%"
+          awk -v cov="$total" 'BEGIN { exit (cov + 0 < 80 ? 1 : 0) }'
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-ubuntu
+          path: coverage.out
+
+  test-darwin:
+    name: Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go build
+        run: make build
+
+      - name: go test
+        run: make test

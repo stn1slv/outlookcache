@@ -1,0 +1,72 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: outlookcache
+    env:
+      - CGO_ENABLED=0
+    # New Outlook for Mac keeps the store this tool reads, so only macOS
+    # binaries are built.
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/outlookcache
+    binary: outlookcache
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    ids:
+      - outlookcache
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_NOTICES.md
+      - docs/STORAGE.md
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+homebrew_casks:
+  - name: outlookcache
+    binaries:
+      - outlookcache
+    repository:
+      owner: stn1slv
+      name: homebrew-tap
+      # A custom token is needed to push to a different repository
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    # Skip the tap until the TAP_GITHUB_TOKEN secret is set, so a release
+    # without it still succeeds.
+    skip_upload: '{{ if eq (index .Env "TAP_GITHUB_TOKEN") "" }}true{{ else }}false{{ end }}'
+    homepage: "https://github.com/stn1slv/outlookcache"
+    description: "Read the local mail cache of new Outlook for Mac from the command line or over MCP"
+    caveats: "If macOS denies access to the Outlook store, give the terminal or MCP host app Full Disk Access."
+    # The binary is not signed, so remove the quarantine flag that macOS
+    # puts on downloaded files.
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/outlookcache"]
+          end
