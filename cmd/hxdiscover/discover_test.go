@@ -256,3 +256,24 @@ func TestExtractTextUsesLengthTable(t *testing.T) {
 	assert.Equal(t, "Quarterly numbers", got.subject, "subject found before the class")
 	assert.Equal(t, "RE: Quarterly numbers", got.topic)
 }
+
+func TestParseRecipients(t *testing.T) {
+	t.Parallel()
+	obj := bytes.Join([][]byte{
+		{0x80, 0, 0, 0, 0x0e, 0x7c, 0x0e, 0x70, 0x01, 0x01, 0x00},
+		encodeU16("alice@example.com"),
+		{0, 0},
+		encodeU16("Alice Example"),
+		{0, 0},
+		{0x01, 0x00, 0x05, 0x00, 0x00, 0x00},
+		encodeU16("bob@example.com"),
+		{0, 0},
+		encodeU16("Bob Other"),
+		{0, 0},
+		{0x02, 0x00, 0x00, 0x00},
+		encodeU16("alice@example.com"),
+		{0, 0}, // repeated address
+	}, nil)
+	got := parseRecipients(obj)
+	assert.Equal(t, []recipient{{"alice@example.com", "Alice Example"}, {"bob@example.com", "Bob Other"}}, got)
+}
