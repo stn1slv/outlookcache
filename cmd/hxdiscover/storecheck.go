@@ -34,7 +34,7 @@ func storeCheck(data []byte, profile string, w io.Writer) error {
 		for name, ok := range map[string]bool{
 			"msg subject": m.Subject != "", "from": m.From != nil, "to": len(m.To) > 0, "sent": m.Sent != nil, "received": m.Received != nil,
 			"msg preview": m.Preview != "", "message_id": m.MessageID != "", "account": m.AccountID != "", "conversation": m.ConversationID != "",
-			"read": m.Read, "has_attachments": m.HasAttachments, "attachments": len(m.Attachments) > 0, "confirmed": m.Confirmed,
+			"read": m.Read, "reply_to": m.ReplyToID != "", "has_attachments": m.HasAttachments, "attachments": len(m.Attachments) > 0, "confirmed": m.Confirmed,
 		} {
 			if ok {
 				c["field set: "+name]++

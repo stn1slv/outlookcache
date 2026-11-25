@@ -32,6 +32,7 @@
 //	hxdiscover bodymap -block offset
 //	hxdiscover bodyprobe
 //	hxdiscover bodyrule
+//	hxdiscover quotecheck [-store path]
 //	hxdiscover efmcheck [-store path] (reads EFMData files next to the store, read-only)
 //
 // Real names and addresses are passed only through HXD_MATCH and are never
@@ -330,6 +331,8 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			return err
 		}
 		cmd = func(data []byte) error { return bodyMap(data, *blockOff, w) }
+	case "quotecheck":
+		cmd = func(data []byte) error { return quoteCheck(data, filepath.Dir(*store), w) }
 	case "efmcheck":
 		cmd = func(data []byte) error { return efmCheck(data, filepath.Dir(*store), w) }
 	case "bodyrule":
