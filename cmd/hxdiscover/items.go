@@ -81,7 +81,7 @@ func itemCheck(data []byte, show uint64, w io.Writer) error {
 		key := fmt.Sprintf("%x", c.folder)
 		if c.status&0x02 == 0 {
 			unread++
-			key += " unread"
+			key += unreadSuffix
 		}
 		folders[key]++
 		// Strict rule: an item with no indexed copy is live only when its
@@ -123,3 +123,6 @@ func itemCheck(data []byte, show uint64, w io.Writer) error {
 	printCounts(w, "conversation sizes (5 = 5 or more)", sizes)
 	return nil
 }
+
+// unreadSuffix marks unread rows in per-folder counts.
+const unreadSuffix = " unread"

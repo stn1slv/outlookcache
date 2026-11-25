@@ -77,7 +77,7 @@ func indexCheck(data []byte, show uint64, w io.Writer) error {
 			key := fmt.Sprintf("%x", live[0].folder)
 			if live[0].status&0x02 == 0 {
 				unread++
-				key += " unread"
+				key += unreadSuffix
 			}
 			folders[key]++
 		}

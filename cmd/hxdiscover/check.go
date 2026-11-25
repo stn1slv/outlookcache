@@ -61,7 +61,7 @@ func check(data []byte, w io.Writer) error {
 		key := fmt.Sprintf("%x", c.folder)
 		if c.status&0x02 == 0 {
 			unread++
-			key += " unread"
+			key += unreadSuffix
 		}
 		folders[key]++
 	}
