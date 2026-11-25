@@ -218,3 +218,41 @@ func TestScanItemsAcceptsShortItems(t *testing.T) {
 	assert.Equal(t, uint64(0x187578ae), got[0].folder)
 	assert.Equal(t, uint64(0x18800020), got[0].conv)
 }
+
+// syntheticItem builds an item object with a length table and a string
+// run in the second layout (subject before the class).
+func syntheticItem(id, conv uint64, before, after []string) []byte {
+	head := make([]byte, 1700)
+	put := func(off int, s string) { binary.LittleEndian.PutUint16(head[off:], uint16(len(encodeU16(s))+2)) }
+	put(lenSenderAddr, "alice@example.com")
+	put(lenSenderName, "Alice Example")
+	put(lenMessageID, "<m1@example.com>")
+	put(lenSubject, "Quarterly numbers")
+	put(lenTopic, "RE: Quarterly numbers")
+	put(lenPreview, "short preview")
+	var run []byte
+	run = binary.LittleEndian.AppendUint64(run, id)
+	run = append(run, 0, 0, 0xc7, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	run = binary.LittleEndian.AppendUint64(run, conv)
+	for _, s := range append(append(before, "IPM.Note"), after...) {
+		run = append(append(run, encodeU16(s)...), 0, 0)
+	}
+	run = append(run, 0, 0, 0, 0)
+	return bytes.Join([][]byte{head, run}, nil)
+}
+
+func TestExtractTextUsesLengthTable(t *testing.T) {
+	t.Parallel()
+	obj := syntheticItem(0x18800001, 0x18800002,
+		[]string{"Quarterly numbers", "alice@example.com", "Bob Other", "Alice Example"},
+		[]string{"<m1@example.com>", "<parent@example.com>", "short preview", "RE: Quarterly numbers"})
+	got, ok := extractText(obj, 0x18800001, 0x18800002)
+	require.True(t, ok)
+	assert.Equal(t, "IPM.Note", got.class)
+	assert.Equal(t, "alice@example.com", got.senderAddr)
+	assert.Equal(t, "Alice Example", got.senderName)
+	assert.Equal(t, "<m1@example.com>", got.messageID)
+	assert.Equal(t, "short preview", got.preview)
+	assert.Equal(t, "Quarterly numbers", got.subject, "subject found before the class")
+	assert.Equal(t, "RE: Quarterly numbers", got.topic)
+}

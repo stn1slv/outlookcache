@@ -299,6 +299,20 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		cmd = func(data []byte) error { return itemCheck(data, show, m, w) }
 	case "fields":
 		cmd = func(data []byte) error { return fieldCheck(data, now, w) }
+	case "lens":
+		cmd = func(data []byte) error { return stringLengthFields(data, w) }
+	case "probelens":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return probeLengths(data, v, w) }
+	case "lentable":
+		cmd = func(data []byte) error { return lengthTableCheck(data, w) }
+	case "subjgap":
+		cmd = func(data []byte) error { return subjectGap(data, w) }
+	case "text":
+		cmd = func(data []byte) error { return textCheck(data, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":
