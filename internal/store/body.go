@@ -23,7 +23,7 @@ const (
 // the first object framing. Offsets are relative to the UTF-16 item class
 // in the head (at +1893 of the payload in most blocks).
 const (
-	bodyMinClassAt = 214
+	bodyClassFrom  = 1893 // the class is never earlier (whole store)
 	bodyPrefixAt   = -214 // u32 size of a field that can precede the body
 	bodyMainAt     = -210 // u32: flags in the high byte, body size below
 	bodySecondAt   = -202 // u32: flags and size of a second HTML field
@@ -52,16 +52,18 @@ func ParseBody(payload []byte) BodyRef {
 	hxstore.ForEachFraming(payload, func(f hxstore.Framing) { head = min(head, f.Offset) })
 	hd := payload[:head]
 	cls := classAt(hd)
-	if cls < bodyMinClassAt {
+	if cls < 0 {
 		return BodyRef{Kind: BodyUnparsed}
 	}
 	main := binary.LittleEndian.Uint32(hd[cls+bodyMainAt:])
 	n := int(main & bodySizeMask)
 	switch main >> 24 {
 	case 0:
-		return BodyRef{Kind: BodyNone}
+		if n == 0 {
+			return BodyRef{Kind: BodyNone}
+		}
 	case bodyFlagFile:
-		return externalBody(hd)
+		return externalBody(hd[cls:])
 	case bodyFlagInline:
 		if html := inlineBody(hd, cls, n); html != nil {
 			return BodyRef{Kind: BodyInline, HTML: html}
@@ -71,15 +73,20 @@ func ParseBody(payload []byte) BodyRef {
 }
 
 // classAt returns the offset of the first UTF-16 item class ("IPM." or
-// "REPORT.") in the head, or -1.
+// "REPORT.") at or after bodyClassFrom in the head, or -1. Text before
+// that offset is never taken as the class.
 func classAt(hd []byte) int {
+	tail := hd[min(len(hd), bodyClassFrom):]
 	at := -1
 	for _, prefix := range []string{"IPM.", "REPORT."} {
-		if k := bytes.Index(hd, encodeU16(prefix)); k >= 0 && (at < 0 || k < at) {
+		if k := bytes.Index(tail, encodeU16(prefix)); k >= 0 && (at < 0 || k < at) {
 			at = k
 		}
 	}
-	return at
+	if at < 0 {
+		return -1
+	}
+	return bodyClassFrom + at
 }
 
 // inlineBody finds the n-byte HTML document that follows the class. The
@@ -109,6 +116,7 @@ func inlineBody(hd []byte, cls, n int) []byte {
 			return hd[p : p+n]
 		}
 	}
+	// Fallback: a window that ends at a "</html>" and starts a document.
 	low := asciiLower(hd)
 	for o := r; ; {
 		k := bytes.Index(low[o:], htmlEnd)
@@ -118,7 +126,7 @@ func inlineBody(hd []byte, cls, n int) []byte {
 		e := o + k + len(htmlEnd)
 		o = e
 		for t := 0; t <= 4; t++ { // trailing white space inside the size
-			if p := e + t - n; p >= r && p+n <= len(hd) && isHTMLDoc(hd[p:p+n]) {
+			if p := e + t - n; p >= r && p+n <= len(hd) && docStart(low[p:]) && isHTMLDoc(hd[p:p+n]) {
 				return hd[p : p+n]
 			}
 		}
@@ -138,15 +146,20 @@ func runStart(hd []byte, cls int) int {
 }
 
 // isHTMLDoc reports a complete HTML document in valid UTF-8: it starts with
-// a tag and, without trailing white space, ends with </html>.
+// '<' and, without trailing white space, ends with </html>.
 func isHTMLDoc(b []byte) bool {
-	t := bytes.TrimSpace(b)
+	t := bytes.TrimRight(b, " \t\r\n")
 	return len(t) > len(htmlEnd) && t[0] == '<' && bytes.Equal(asciiLower(t[len(t)-len(htmlEnd):]), htmlEnd) && utf8.Valid(t)
 }
 
-// externalBody reads the EFMData paths stored in the head. Only the folder
-// number and the file name are kept; both are checked against a strict
-// pattern.
+// docStart reports lower-case bytes that start an HTML document.
+func docStart(low []byte) bool {
+	return bytes.HasPrefix(low, []byte("<html")) || bytes.HasPrefix(low, []byte("<!doctype"))
+}
+
+// externalBody reads the EFMData paths stored after the class. Only the
+// folder number and the file name are kept; both are checked against a
+// strict pattern, and paths in another folder than the first are ignored.
 func externalBody(hd []byte) BodyRef {
 	ref := BodyRef{Kind: BodyExternal}
 	seen := map[string]bool{}
@@ -193,20 +206,35 @@ func asciiLower(b []byte) []byte {
 }
 
 // Body returns where the body of message id is stored. It decodes the
-// block of the chosen item copy again; the store keeps the snapshot bytes
-// for this.
+// item's own block again (the store keeps the snapshot bytes for this) and
+// returns BodyUnparsed when the message has no block keyed by its ID.
 func (s *Store) Body(id string) (BodyRef, error) {
 	v, err := strconv.ParseUint(id, 16, 64)
 	if err != nil {
 		return BodyRef{}, fmt.Errorf("%w: %q", ErrUnknownMessage, id)
 	}
-	block, ok := s.itemBlock[v]
-	if !ok {
+	known := false
+	for i := range s.Messages {
+		if s.Messages[i].ID == id {
+			known = true
+			break
+		}
+	}
+	if !known {
 		return BodyRef{}, fmt.Errorf("%w: %q", ErrUnknownMessage, id)
+	}
+	block, ok := s.bodyBlock[v]
+	if !ok {
+		return BodyRef{Kind: BodyUnparsed}, nil
 	}
 	b, err := hxstore.DecodeAt(s.data, block)
 	if err != nil {
 		return BodyRef{}, err
 	}
-	return ParseBody(b.Payload), nil
+	if b.Key != v { // never return another item's body record
+		return BodyRef{Kind: BodyUnparsed}, nil
+	}
+	ref := ParseBody(b.Payload)
+	ref.HTML = bytes.Clone(ref.HTML) // do not keep the whole block alive
+	return ref, nil
 }

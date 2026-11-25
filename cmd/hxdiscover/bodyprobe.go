@@ -42,7 +42,11 @@ func bodyProbe(data []byte, w io.Writer) error {
 		for _, t := range tokenize(b.Payload[:head]) {
 			switch {
 			case t.kind == tokU16 && (strings.HasPrefix(t.text, "IPM.") || strings.HasPrefix(t.text, "REPORT.")):
-				parts = append(parts, fmt.Sprintf("@%d %q", t.off, t.text))
+				cls := shape(t.text)
+				if safeItemClass(t.text) {
+					cls = fmt.Sprintf("%q", t.text)
+				}
+				parts = append(parts, fmt.Sprintf("@%d %s", t.off, cls))
 			case t.kind == tokU8 && strings.HasPrefix(t.text, "<"):
 				low := strings.ToLower(t.text)
 				hd := b.Payload[:head]
@@ -65,8 +69,8 @@ func bodyProbe(data []byte, w io.Writer) error {
 						o += k + 1
 					}
 				}
-				parts = append(parts, fmt.Sprintf("@%d html(%d marker=%t start=%q end=%q) sizes:%v", t.off, len(t.text),
-					strings.Contains(low, markerPrefix), low[:min(6, len(low))], low[max(0, len(low)-9):], at))
+				parts = append(parts, fmt.Sprintf("@%d html(%d marker=%t starts_html=%t ends_html=%t) sizes:%v", t.off, len(t.text),
+					strings.Contains(low, markerPrefix), strings.HasPrefix(low, "<html"), strings.HasSuffix(strings.TrimSpace(low), "</html>"), at))
 			case t.kind == tokU8 && len(t.text) >= 4:
 				parts = append(parts, fmt.Sprintf("@%d u8(%d)", t.off, len(t.text)))
 			}

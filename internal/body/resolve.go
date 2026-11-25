@@ -13,11 +13,15 @@ var ErrNoBody = errors.New("no stored body")
 
 // HTML returns the HTML of a body reference: inline bytes as they are, or
 // the content of its EFMData file under profile (see ReadEFM). source names
-// where the body came from: "inline" or "efmdata:<file>".
+// where the body came from: "inline" or "efmdata:<file>". limit caps the
+// body size for both kinds (0 or less means MaxBytes).
 func HTML(ref store.BodyRef, profile string, limit int64) (doc []byte, source string, err error) {
 	switch ref.Kind {
 	case store.BodyInline:
-		if limit > 0 && int64(len(ref.HTML)) > limit {
+		if limit <= 0 {
+			limit = MaxBytes
+		}
+		if int64(len(ref.HTML)) > limit {
 			return nil, store.BodyInline, ErrTooLarge
 		}
 		return ref.HTML, store.BodyInline, nil

@@ -22,8 +22,10 @@ var quoteMarkers = []string{
 	`id="olk_src_body_section"`, `>from:<`, `>from: <`, `<b>from:</b>`, `<b>from: </b>`,
 }
 
-// quoteCheck counts quote markers in the bodies of all messages, split by
-// whether the message is a reply (it has a reply-to link). Counts only.
+// quoteCheck converts every body to text with and without quote cutting
+// (body.ToText) and prints counts only: markers in the HTML, the marker
+// that cut, empty results, and quoted headers that a looser check still
+// finds after cutting.
 func quoteCheck(data []byte, profile string, w io.Writer) error {
 	s, err := store.Load(data, "HxStore.hxd")
 	if err != nil {
@@ -43,14 +45,19 @@ func quoteCheck(data []byte, profile string, w io.Writer) error {
 		c[fmt.Sprintf("text: quote removed=%t", cut.QuoteRemoved)]++
 		switch {
 		case full.Text == "":
-			c[fmt.Sprintf("text: empty even without cutting; raw text outside head/script/style=%s; class %s", rawTextSize(html), m.ItemClass)]++
+			class := "other"
+			if safeItemClass(m.ItemClass) {
+				class = m.ItemClass
+			}
+			c[fmt.Sprintf("text: empty even without cutting; raw text outside head/script/style=%s; class %s", rawTextSize(html), class)]++
 		case cut.Text == "":
 			c["text: empty after cutting by "+cut.QuoteMarker]++
 		}
 		if cut.QuoteRemoved {
 			c[fmt.Sprintf("text: kept share of full text %s", share(len(cut.Text), len(full.Text)))]++
 		}
-		if leftHeader.MatchString(cut.Text) {
+		if loc := leftHeader.FindStringIndex(cut.Text); loc != nil {
+			c["  left header labels: "+headerLabels(cut.Text[loc[0]:loc[1]])]++
 			var ms []string
 			low := asciiLower(html)
 			for _, mk := range quoteMarkers {
@@ -66,26 +73,27 @@ func quoteCheck(data []byte, profile string, w io.Writer) error {
 		if strings.HasPrefix(strings.ToLower(m.Subject), markerPrefix) {
 			c[fmt.Sprintf("probe: text holds the marker=%t", strings.Contains(strings.ToLower(cut.Text), markerPrefix))]++
 		}
-		reply := m.ReplyToID != ""
-		c[fmt.Sprintf("bodies, reply=%t", reply)]++
+		c["bodies"]++
 		low := asciiLower(html)
 		any := false
 		for _, mk := range quoteMarkers {
 			if bytes.Contains(low, []byte(mk)) {
-				c[fmt.Sprintf("reply=%t marker %s", reply, mk)]++
+				c["marker "+mk]++
 				any = true
 			}
 		}
 		if !any {
-			c[fmt.Sprintf("reply=%t no marker", reply)]++
+			c["no marker"]++
 		}
 	}
 	printCounts(w, "quote markers (counts only)", c)
 	return nil
 }
 
-// leftHeader matches a quoted-message header block that cutting missed.
-var leftHeader = regexp.MustCompile(`(?m)^(From|Von|De|От):.*\n(Sent|Gesendet|Envoy|Отправлено|Date):`)
+// leftHeader is a looser check than the cutting rule, so that it can fail:
+// a From line followed within eight lines by any Sent, Date, To or Subject
+// line, with any label language the converter knows or not.
+var leftHeader = regexp.MustCompile(`(?mi)^\s*\S{1,12}:[^\n]*@[^\n]*\n(?:[^\n]*\n){0,7}?\s*(?:sent|date|to|subject|gesendet|datum|an|betreff|отправлено|дата|кому|тема):`)
 
 func share(a, b int) string {
 	if b == 0 {
@@ -128,4 +136,38 @@ func rawTextSize(doc []byte) string {
 			}
 		}
 	}
+}
+
+// knownLabels are header labels that may be printed in counts.
+var knownLabels = func() map[string]bool {
+	m := map[string]bool{}
+	for _, l := range strings.Fields("from sent date to cc subject von gesendet an betreff от отправлено кому тема email e-mail mail sender mobile phone tel reply-to de para asunto") {
+		m[l] = true
+	}
+	return m
+}()
+
+// headerLabels lists the labels at line starts of a match; unknown labels
+// are printed as "?".
+func headerLabels(m string) string {
+	var out []string
+	for _, l := range strings.Split(m, "\n") {
+		l = strings.TrimSpace(l)
+		k := strings.IndexByte(l, ':')
+		if k <= 0 {
+			continue
+		}
+		lab := strings.ToLower(l[:k])
+		if !knownLabels[lab] {
+			script := "latin"
+			for _, r := range lab {
+				if r > 0x7f {
+					script = "non-latin"
+				}
+			}
+			lab = fmt.Sprintf("?(%s,%d chars)", script, len([]rune(lab)))
+		}
+		out = append(out, lab)
+	}
+	return strings.Join(out, ",")
 }

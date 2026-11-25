@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/stn1slv/outlookcache/internal/hxstore"
-	"github.com/stn1slv/outlookcache/internal/store"
 )
 
 // bodyShape checks, for every current message, the block keyed by its
@@ -18,41 +17,13 @@ import (
 // whether a u32 (size | 0x80000000) equal to its byte size appears before
 // the class. It also counts EFMData paths in the block. Counts only.
 func bodyShape(data []byte, w io.Writer) error {
-	s, err := store.Load(data, "HxStore.hxd")
+	blocks, _, err := ownBlocks(data)
 	if err != nil {
-		return err
-	}
-	ix, err := hxstore.ReadIndex(data)
-	if err != nil {
-		return err
-	}
-	want := map[uint64]bool{}
-	for _, m := range s.Messages {
-		var id uint64
-		_, _ = fmt.Sscanf(m.ID, "%x", &id)
-		want[id] = true
-	}
-	type pick struct {
-		payload []byte
-		direct  bool
-	}
-	blocks := map[uint64]pick{}
-	if _, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		if !want[b.Key] {
-			return nil
-		}
-		d := ix.Direct(b.Offset)
-		if old, ok := blocks[b.Key]; !ok || d || !old.direct {
-			blocks[b.Key] = pick{b.Payload, d}
-		}
-		return nil
-	}); err != nil {
 		return err
 	}
 	efm := encodeU16("/EFMData/")
-	c := map[string]int{"messages": len(want), "messages with an own block": len(blocks)}
-	for _, p := range blocks {
-		pl := p.payload
+	c := map[string]int{"messages with an own block": len(blocks)}
+	for _, pl := range blocks {
 		head := len(pl)
 		hxstore.ForEachFraming(pl, func(f hxstore.Framing) { head = min(head, f.Offset) })
 		hd := pl[:head]

@@ -91,7 +91,8 @@ type Stats struct {
 }
 
 // Store is the decoded content of one HxStore.hxd snapshot. It keeps the
-// snapshot bytes to read bodies on demand.
+// snapshot bytes to read bodies on demand, so the caller must not change
+// the slice passed to Load while the Store is in use.
 type Store struct {
 	Accounts []Account
 	Folders  []Folder
@@ -99,7 +100,7 @@ type Store struct {
 	Stats    Stats
 
 	data      []byte
-	itemBlock map[uint64]int64 // message ID -> block of the chosen copy
+	bodyBlock map[uint64]int64 // message ID -> block that holds its body record
 }
 
 type objVersion struct {
@@ -152,7 +153,7 @@ func Load(data []byte, file string) (*Store, error) {
 	if !h.Supported() {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedVersion, h.Version)
 	}
-	s := &Store{data: data, itemBlock: map[uint64]int64{}}
+	s := &Store{data: data, bodyBlock: map[uint64]int64{}}
 	ix, err := hxstore.ReadIndex(data)
 	switch {
 	case errors.Is(err, hxstore.ErrIndexLayout):
@@ -169,8 +170,14 @@ func Load(data []byte, file string) (*Store, error) {
 	var recs []folderRec
 	roots := map[uint64]rootSeen{}
 	dirVotes := map[uint64]map[string]int{} // block key -> dir -> votes
+	blockKey := map[int64]uint64{}
+	ownBlock := map[uint64]objVersion{} // block key -> its block (direct slot, else last)
 	st, damage, err := hxstore.Scan(data, file, func(b hxstore.Block) error {
 		direct := ix.Direct(b.Offset)
+		blockKey[b.Offset] = b.Key
+		if old, ok := ownBlock[b.Key]; !ok || direct || !old.direct {
+			ownBlock[b.Key] = objVersion{block: b.Offset, direct: direct}
+		}
 		if roles, ok := readRootSlots(b.Payload, b.Key); ok {
 			if old, seen := roots[b.Key]; !seen || direct || !old.direct {
 				roots[b.Key] = rootSeen{roles, direct}
@@ -261,6 +268,17 @@ func Load(data []byte, file string) (*Store, error) {
 		c, conf, amb := pickCurrent(cs)
 		picks[id] = chosen{c, conf, amb}
 		want(c.block, c.frame)
+		// The body record is in the item's own block: the chosen copy's
+		// block when its key is the item ID, else the item's block that the
+		// index points at (or the last one).
+		if blockKey[c.block] == id {
+			s.bodyBlock[id] = c.block
+		} else if v, ok := ownBlock[id]; ok {
+			s.bodyBlock[id] = v.block
+			if need[v.block] == nil {
+				need[v.block] = map[int]bool{}
+			}
+		}
 		for _, t := range []uint16{typeTo, typeCc, typeBcc, typeAttachment} {
 			vs := lists[t][id]
 			if len(vs) == 0 {
@@ -279,9 +297,9 @@ func Load(data []byte, file string) (*Store, error) {
 
 	// Pass 2: decode only the blocks that hold chosen objects and keep only
 	// those objects.
-	itemsIn := map[int64][]uint64{} // block -> items whose chosen copy it holds
-	for id, p := range picks {
-		itemsIn[p.block] = append(itemsIn[p.block], id)
+	bodyOf := map[int64][]uint64{} // block -> items whose body record it holds
+	for id, block := range s.bodyBlock {
+		bodyOf[block] = append(bodyOf[block], id)
 	}
 	bodyKind := make(map[uint64]string, len(picks))
 	frames := map[int64]map[int][]byte{}
@@ -290,12 +308,8 @@ func Load(data []byte, file string) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range itemsIn[block] {
-			kind := BodyUnparsed
-			if b.Key == id { // the body record is in the item's own block
-				kind = ParseBody(b.Payload).Kind
-			}
-			bodyKind[id] = kind
+		for _, id := range bodyOf[block] {
+			bodyKind[id] = ParseBody(b.Payload).Kind
 		}
 		m := map[int][]byte{}
 		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) {
@@ -328,7 +342,9 @@ func Load(data []byte, file string) (*Store, error) {
 			Read: p.status&0x02 != 0, HasAttachments: o[itemAttachAt]&0x40 != 0,
 			Confirmed: p.confirmed, Ambiguous: p.ambiguous, BodyKind: bodyKind[id],
 		}
-		s.itemBlock[id] = p.block
+		if m.BodyKind == "" {
+			m.BodyKind = BodyUnparsed // no block keyed by the item ID
+		}
 		if v := binary.LittleEndian.Uint64(o[itemReplyToAt:]); ids.has(v) && v != id {
 			m.ReplyToID = hexID(v)
 		}

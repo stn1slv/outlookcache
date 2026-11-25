@@ -34,7 +34,8 @@ func bodyFind(data []byte, maxLines int, w io.Writer) error {
 		low := asciiLower(b.Payload)
 		var frames []hxstore.Framing
 		hxstore.ForEachFraming(b.Payload, func(f hxstore.Framing) { frames = append(frames, f) })
-		for enc, nd := range needles {
+		for _, enc := range []string{tokU16, tokU8} { // fixed order
+			nd := needles[enc]
 			for off := 0; ; {
 				k := bytes.Index(low[off:], nd)
 				if k < 0 {

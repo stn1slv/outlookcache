@@ -3,6 +3,7 @@
 package body
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"unicode/utf8"
 )
 
 var (
@@ -28,6 +30,9 @@ var (
 // MaxBytes is the default limit for one body, after decompression.
 const MaxBytes = 32 << 20
 
+// maxLimit caps any limit, so that limit+1 cannot overflow.
+const maxLimit = 1 << 40
+
 var (
 	dirRe  = regexp.MustCompile(`^[0-9]{1,9}$`)
 	nameRe = regexp.MustCompile(`^[0-9]{1,12}\.dat$`)
@@ -36,15 +41,26 @@ var (
 
 // ReadEFM reads the first readable file of names from
 // <profile>/Files/S0/<dir>/EFMData and returns its content, gunzipped when
-// it is gzip, with the name of the file used. Files are opened read-only
-// through an os.Root, so a link cannot lead outside Files/S0. limit caps
-// the size after decompression (0 means MaxBytes).
+// it is gzip, with the name of the file used. A file must hold UTF-8 text
+// that starts with a tag; otherwise the next name is tried. Files are
+// opened read-only through an os.Root, so a link cannot lead outside
+// Files/S0, and only regular files are opened. limit caps the size after
+// decompression (0 or less means MaxBytes).
 func ReadEFM(profile, dir string, names []string, limit int64) ([]byte, string, error) {
 	if limit <= 0 {
 		limit = MaxBytes
 	}
+	limit = min(limit, maxLimit)
 	if !dirRe.MatchString(dir) {
 		return nil, "", fmt.Errorf("%w: folder %q", ErrBadReference, dir)
+	}
+	if len(names) == 0 {
+		return nil, "", fmt.Errorf("%w: no file names", ErrBadReference)
+	}
+	for _, name := range names {
+		if !nameRe.MatchString(name) {
+			return nil, "", fmt.Errorf("%w: file %q", ErrBadReference, name)
+		}
 	}
 	root, err := os.OpenRoot(filepath.Join(profile, "Files", "S0"))
 	if err != nil {
@@ -53,10 +69,6 @@ func ReadEFM(profile, dir string, names []string, limit int64) ([]byte, string, 
 	defer func() { _ = root.Close() }()
 	var errs []error
 	for _, name := range names {
-		if !nameRe.MatchString(name) {
-			errs = append(errs, fmt.Errorf("%w: file %q", ErrBadReference, name))
-			continue
-		}
 		b, err := readOne(root, path.Join(dir, "EFMData", name), limit)
 		if err == nil {
 			return b, name, nil
@@ -69,33 +81,41 @@ func ReadEFM(profile, dir string, names []string, limit int64) ([]byte, string, 
 	return nil, "", fmt.Errorf("%w: %w", ErrNoFile, errors.Join(errs...))
 }
 
+// errNotHTML reports file content that is not UTF-8 text starting with a
+// tag.
+var errNotHTML = errors.New("content is not HTML text")
+
 func readOne(root *os.Root, name string, limit int64) ([]byte, error) {
-	f, err := root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
-	st, err := f.Stat()
+	// Lstat first: opening a FIFO or a device could block or have side
+	// effects, and a link is not followed.
+	st, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
 	if !st.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s: %w", name, fs.ErrInvalid)
 	}
-	raw, err := readLimited(f, limit)
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	br := bufio.NewReader(f)
+	var src io.Reader = br
+	if head, _ := br.Peek(len(gzipID)); bytes.Equal(head, gzipID) {
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		defer func() { _ = zr.Close() }()
+		src = zr
+	}
+	out, err := readLimited(src, limit)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	if !bytes.HasPrefix(raw, gzipID) {
-		return raw, nil
-	}
-	zr, err := gzip.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
-	}
-	out, err := readLimited(zr, limit)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", name, err)
+	if t := bytes.TrimLeft(out, " \t\r\n\ufeff"); len(t) == 0 || t[0] != '<' || !utf8.Valid(out) {
+		return nil, fmt.Errorf("%s: %w", name, errNotHTML)
 	}
 	return out, nil
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -84,4 +85,22 @@ func TestReadEFMLimits(t *testing.T) {
 	}
 	_, _, err := ReadEFM(dir, "2", []string{"3.dat"}, 0)
 	require.ErrorIs(t, err, ErrNoFile, "broken gzip")
+}
+
+func TestReadEFMChecksContentAndKinds(t *testing.T) {
+	t.Parallel()
+	tiny := gz(t, "<p>x</p>") // the gzip file is larger than its content
+	dir := profile(t, map[string][]byte{"1.dat": []byte("not html"), "2.dat": tiny, "3.dat": {'<', 0xff, 0xfe}})
+	b, name, err := ReadEFM(dir, "2", []string{"1.dat", "3.dat", "2.dat"}, 8)
+	require.NoError(t, err)
+	assert.Equal(t, "2.dat", name, "text that is not HTML or not UTF-8 falls back to the next file")
+	assert.Equal(t, "<p>x</p>", string(b), "the limit applies after decompression")
+
+	_, _, err = ReadEFM(dir, "2", nil, 0)
+	require.ErrorIs(t, err, ErrBadReference)
+
+	fifo := filepath.Join(dir, "Files", "S0", "2", "EFMData", "4.dat")
+	require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+	_, _, err = ReadEFM(dir, "2", []string{"4.dat"}, 0)
+	require.ErrorIs(t, err, ErrNoFile, "a FIFO is not opened")
 }
