@@ -60,7 +60,7 @@ func folderObjects(data []byte, r redactor, w io.Writer) error {
 			var refs []string
 			for i := 18; i+8 <= len(obj) && len(refs) < 8; i++ {
 				v := binary.LittleEndian.Uint64(obj[i:])
-				if v >= 0x18700000 && v < 0x18900000 {
+				if isID(v) {
 					refs = append(refs, fmt.Sprintf("+%d:%x", i, v))
 					i += 7
 				}
@@ -121,7 +121,7 @@ func folderEntries(data []byte) (map[uint64]folderEntry, error) {
 			fe := folderEntry{id: id, owner: owner, name: name}
 			for j := at - 8; j >= max(0, at-32); j-- { // nearest ID-range u64 before the entry
 				v := binary.LittleEndian.Uint64(p[j:])
-				if v >= 0x18700000 && v < 0x18900000 {
+				if isID(v) {
 					fe.account = v
 					fe.kind = binary.LittleEndian.Uint32(p[j+8:])
 					break

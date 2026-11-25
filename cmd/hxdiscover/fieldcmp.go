@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/stn1slv/outlookcache/internal/hxstore"
 )
@@ -14,7 +15,8 @@ import (
 // fieldCompare takes the last folder (class 0x4d) framing of type typ for every ID (framing ID
 // equal to the block key, so the object is the main one of its block) and
 // prints one line per ID with the u16 values at the offsets that differ
-// between IDs. Text spans are printed as "txt".
+// between IDs. Text spans, and any single u16 that decodes as a letter or
+// digit in any script (short names, CJK), are printed as "txt".
 func fieldCompare(data []byte, typ uint16, w io.Writer) error {
 	objs := map[uint64][]byte{}
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
@@ -65,7 +67,7 @@ func fieldCompare(data []byte, typ uint16, w io.Writer) error {
 		o, m := objs[id], masks[id]
 		var sb strings.Builder
 		for _, i := range offs {
-			if m[i] || m[i+1] {
+			if m[i] || m[i+1] || textUnit(binary.LittleEndian.Uint16(o[i:])) {
 				sb.WriteString(" txt")
 				continue
 			}
@@ -74,4 +76,10 @@ func fieldCompare(data []byte, typ uint16, w io.Writer) error {
 		_, _ = fmt.Fprintf(w, "%x size=%d%s\n", id, len(o), sb.String())
 	}
 	return nil
+}
+
+// textUnit reports a UTF-16 code unit that could be part of a name.
+func textUnit(v uint16) bool {
+	r := rune(v)
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
 }

@@ -1,99 +1,56 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
-
-	"github.com/stn1slv/outlookcache/internal/hxstore"
 )
 
-// Header fields seen in every store so far (UNVERIFIED meaning): u64 at
-// 0x58 and 0x78 point to two areas of equal size that both hold
-// offset/256 values of blocks.
-const (
-	hdrAreaA = 0x58
-	hdrAreaB = 0x78
-)
-
-// refSet holds every u32 value found at any byte position in data[lo:hi].
-func refSet(data []byte, lo, hi int) map[uint32]bool {
-	s := map[uint32]bool{}
-	for i := lo; i+4 <= hi; i++ {
-		s[binary.LittleEndian.Uint32(data[i:])] = true
-	}
-	return s
-}
-
-// indexCheck tests whether the areas at header 0x58 and 0x78 point at the
-// live copy of each message: for every message-form 0xc7 copy it checks
-// whether offset/256 of its block appears in area A or area B, then counts
-// per ID how many copies are referenced and whether the referenced one has
-// the highest stamp.
+// indexCheck tests the candidate live-block index: for every message-form
+// 0xc7 copy it checks whether offset/256 of its block appears in area A or
+// area B, then counts per ID how many copies are indexed and whether the
+// indexed one has the highest stamp. With show != 0 it lists every copy of
+// that message ID.
 func indexCheck(data []byte, show uint64, w io.Writer) error {
-	if len(data) < 0x80 {
-		return hxstore.ErrNotHxStore
+	li, err := readLiveIndex(data)
+	if err != nil {
+		return err
 	}
-	a := int(binary.LittleEndian.Uint64(data[hdrAreaA:]))
-	b := int(binary.LittleEndian.Uint64(data[hdrAreaB:]))
-	size := b - a
-	if a <= 0 || size <= 0 || b+size > len(data) {
-		return fmt.Errorf("unexpected area offsets %#x %#x", a, b)
-	}
-	areas := []map[uint32]bool{refSet(data, a, a+size), refSet(data, b, b+size)}
-	_, _ = fmt.Fprintf(w, "area A=%#x area B=%#x size=%#x\n", a, b, size)
+	_, _ = fmt.Fprintf(w, "area A=%#x area B=%#x size=%#x\n", li.start, li.start+li.size, li.size)
 
-	blocksRef := [2]int{}
+	blocks, aligned, refd := map[int64]bool{}, 0, [2]int{}
 	copies := map[uint64][]c7copy{}
-	refd := map[int64][2]bool{}
-	st, _, err := hxstore.Scan(data, "HxStore.hxd", func(blk hxstore.Block) error {
-		v := uint32(blk.Offset / 256)
-		r := [2]bool{blk.Offset%256 == 0 && areas[0][v], blk.Offset%256 == 0 && areas[1][v]}
-		refd[blk.Offset] = r
-		for i := range r {
-			if r[i] {
-				blocksRef[i]++
-			}
+	other := 0
+	st, err := scanMessages(data, func(c c7copy, folderOK bool) {
+		if !folderOK {
+			other++
+			return
 		}
-		p := blk.Payload
-		for off := 0; ; {
-			k := bytes.Index(p[off:], objMagic)
-			if k < 0 || off+k+18 > len(p) {
-				return nil
+		copies[c.id] = append(copies[c.id], c)
+		if !blocks[c.block] {
+			blocks[c.block] = true
+			if c.block%256 == 0 {
+				aligned++
 			}
-			o := off + k
-			off = o + 4
-			n := int(binary.LittleEndian.Uint32(p[o+14:]))
-			if binary.LittleEndian.Uint16(p[o+12:]) != 0xc7 || o+n > len(p) || n < 1800 ||
-				!isID(binary.LittleEndian.Uint64(p[o+32:])) || !isID(binary.LittleEndian.Uint64(p[o+1166:])) {
-				continue
+			for i := range refd {
+				if li.indexed(c.block, i) {
+					refd[i]++
+				}
 			}
-			var sb [8]byte
-			copy(sb[:6], p[o+370:])
-			id := binary.LittleEndian.Uint64(p[o+4:])
-			copies[id] = append(copies[id], c7copy{
-				stamp: binary.LittleEndian.Uint64(sb[:]), status: p[o+1772], flag: p[o+1742],
-				folder: binary.LittleEndian.Uint64(p[o+1166:]), block: blk.Offset, key: blk.Key,
-			})
 		}
 	})
 	if err != nil {
 		return err
 	}
-	aligned := 0
-	for off := range refd {
-		if off%256 == 0 {
-			aligned++
+	_, _ = fmt.Fprintf(w, "valid blocks=%d blocks with message copies=%d at 256-byte boundary=%d indexed in A=%d in B=%d other layout copies (skipped)=%d\n",
+		st.Valid, len(blocks), aligned, refd[0], refd[1], other)
+	if show != 0 {
+		for _, c := range copies[show] {
+			_, _ = fmt.Fprintf(w, "copy id=%x block@%d stamp=%x status=%02x folder=%x indexedA=%t indexedB=%t\n",
+				show, c.block, c.stamp, c.status, c.folder, li.indexed(c.block, 0), li.indexed(c.block, 1))
 		}
 	}
-	_, _ = fmt.Fprintf(w, "valid blocks=%d at 256-byte boundary=%d referenced in A=%d in B=%d\n", st.Valid, aligned, blocksRef[0], blocksRef[1])
-	for _, c := range copies[show] {
-		r := refd[c.block]
-		_, _ = fmt.Fprintf(w, "copy id=%x block@%d stamp=%x status=%02x folder=%x liveA=%t liveB=%t\n", show, c.block, c.stamp, c.status, c.folder, r[0], r[1])
-	}
-	afterCheckpoint(copies, refd, 0, w)
-	for i, name := range []string{"A", "B"} {
+	for area, name := range []string{"A", "B"} {
+		afterCheckpoint(copies, li, area, name, w)
 		hist := map[string]int{}
 		unread, folders := 0, map[string]int{}
 		for _, cs := range copies {
@@ -101,32 +58,21 @@ func indexCheck(data []byte, show uint64, w io.Writer) error {
 			maxStamp := uint64(0)
 			for _, c := range cs {
 				maxStamp = max(maxStamp, c.stamp)
-				if refd[c.block][i] {
+				if li.indexed(c.block, area) {
 					live = append(live, c)
 				}
 			}
 			switch {
 			case len(live) == 0:
-				hist["no live copy"]++
-				top := cs[0]
-				for _, c := range cs {
-					if c.stamp > top.stamp {
-						top = c
-					}
-				}
-				if top.status&0x02 == 0 {
-					hist[fmt.Sprintf("no live copy, newest unread, folder %x", top.folder)]++
-				}
-				hist[fmt.Sprintf("no live copy, newest folder %x, stamp top byte %x", top.folder, top.stamp>>40)]++
+				hist["no indexed copy"]++
 				continue
 			case len(live) > 1:
-				hist[fmt.Sprintf("%d live copies", len(live))]++
+				hist[fmt.Sprintf("%d indexed copies", len(live))]++
 				continue
-			}
-			if live[0].stamp == maxStamp {
-				hist["1 live copy, has highest stamp"]++
-			} else {
-				hist["1 live copy, older stamp"]++
+			case live[0].stamp == maxStamp:
+				hist["1 indexed copy, has highest stamp"]++
+			default:
+				hist["1 indexed copy, older stamp"]++
 			}
 			key := fmt.Sprintf("%x", live[0].folder)
 			if live[0].status&0x02 == 0 {
@@ -135,24 +81,31 @@ func indexCheck(data []byte, show uint64, w io.Writer) error {
 			}
 			folders[key]++
 		}
-		printCounts(w, "area "+name+": message IDs by live copies", hist)
-		_, _ = fmt.Fprintf(w, "area %s: unread among single live copies=%d\n", name, unread)
-		printCounts(w, "area "+name+": live copies per folder", folders)
+		printCounts(w, "area "+name+": message IDs by indexed copies", hist)
+		_, _ = fmt.Fprintf(w, "area %s: unread among single indexed copies=%d\n", name, unread)
+		printCounts(w, "area "+name+": indexed copies per folder", folders)
 	}
 	return nil
 }
 
-// afterCheckpoint reports copies newer than every indexed copy: the
-// highest stamp among indexed message copies is taken as the checkpoint
-// time, and IDs whose newest copy is above it are listed by folder.
-func afterCheckpoint(copies map[uint64][]c7copy, refd map[int64][2]bool, area int, w io.Writer) {
+// afterCheckpoint reports message IDs whose newest state may be missing
+// from the index. The highest stamp among indexed copies is taken as the
+// checkpoint. An ID is reported when its newest copy is not indexed and has
+// a stamp >= the checkpoint, or when an unindexed copy has the same stamp
+// as the indexed one but a different status or folder (a mark-read does not
+// change the stamp, so such a change is ambiguous).
+func afterCheckpoint(copies map[uint64][]c7copy, li liveIndex, area int, name string, w io.Writer) {
 	var ckpt uint64
 	for _, cs := range copies {
 		for _, c := range cs {
-			if refd[c.block][area] {
+			if li.indexed(c.block, area) {
 				ckpt = max(ckpt, c.stamp)
 			}
 		}
+	}
+	if ckpt == 0 {
+		_, _ = fmt.Fprintf(w, "area %s: no indexed message copy with a stamp, checkpoint unknown\n", name)
+		return
 	}
 	hist := map[string]int{}
 	for _, cs := range copies {
@@ -162,19 +115,26 @@ func afterCheckpoint(copies map[uint64][]c7copy, refd map[int64][2]bool, area in
 			if c.stamp > top.stamp {
 				top = c
 			}
-			if refd[c.block][area] {
+			if li.indexed(c.block, area) {
 				live = &cs[i]
 			}
 		}
-		if top.stamp < ckpt || (live != nil && live.stamp == top.stamp) {
-			continue
+		switch {
+		case live != nil && live.stamp == top.stamp:
+			for _, c := range cs {
+				if c.stamp == live.stamp && !li.indexed(c.block, area) && (c.status != live.status || c.folder != live.folder) {
+					hist["unindexed copy with the same stamp but other status or folder (ambiguous)"]++
+					break
+				}
+			}
+		case top.stamp >= ckpt && !li.indexed(top.block, area):
+			state := "no indexed copy"
+			if live != nil {
+				state = fmt.Sprintf("indexed copy differs=%t", live.folder != top.folder || live.status != top.status)
+			}
+			hist[fmt.Sprintf("newest copy not indexed, stamp >= checkpoint, %s, newest folder %x", state, top.folder)]++
 		}
-		state := "no indexed copy"
-		if live != nil {
-			state = fmt.Sprintf("indexed copy differs=%t", live.folder != top.folder || live.status != top.status)
-		}
-		hist[fmt.Sprintf("newest not indexed, stamp >= checkpoint, %s, newest folder %x", state, top.folder)]++
 	}
-	_, _ = fmt.Fprintf(w, "checkpoint stamp=%x\n", ckpt)
-	printCounts(w, "IDs with a copy newer than the checkpoint", hist)
+	_, _ = fmt.Fprintf(w, "area %s: checkpoint stamp=%x\n", name, ckpt)
+	printCounts(w, "area "+name+": IDs whose newest state may be missing from the index", hist)
 }

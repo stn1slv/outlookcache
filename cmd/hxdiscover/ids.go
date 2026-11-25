@@ -54,7 +54,7 @@ func ids(data []byte, marker string, w io.Writer) error {
 			}
 			for i := 18; i+8 <= m; i++ {
 				v := binary.LittleEndian.Uint64(obj[i:])
-				if v >= 0x18700000 && v < 0x18900000 {
+				if isID(v) {
 					r.refs = append(r.refs, fmt.Sprintf("+%d:%x", i, v))
 				}
 			}

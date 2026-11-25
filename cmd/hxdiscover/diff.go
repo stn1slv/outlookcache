@@ -18,11 +18,11 @@ type window struct {
 
 const diffSpan = 4096
 
-func windows(data []byte, marker string, key int64) ([]window, error) {
+func windows(data []byte, marker string, key keyFilter) ([]window, error) {
 	needle := encodeU16(marker)
 	var out []window
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		if key >= 0 && b.Key != uint64(key) {
+		if !key.match(b.Key) {
 			return nil
 		}
 		k := bytes.Index(asciiLower(b.Payload), needle)
@@ -38,7 +38,7 @@ func windows(data []byte, marker string, key int64) ([]window, error) {
 
 // diffSnapshots reports, for every marker window in b that has no identical
 // window in a, the byte ranges that differ from the most similar window in a.
-func diffSnapshots(a, b []byte, r redactor, key int64, w io.Writer) error {
+func diffSnapshots(a, b []byte, r redactor, key keyFilter, w io.Writer) error {
 	wa, err := windows(a, r.marker, key)
 	if err != nil {
 		return err

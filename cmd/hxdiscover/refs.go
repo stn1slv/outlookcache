@@ -15,15 +15,7 @@ import (
 // counts, in the raw file and in decoded payloads, the u32 and u64 encodings
 // of the offset itself and of offset/4096, offset/512 and offset/16. It
 // helps to find an index that points at the live copy of an object.
-func blockRefs(data []byte, list string, w io.Writer) error {
-	var offs []uint64
-	for _, s := range strings.Split(list, ",") {
-		v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
-		if err != nil {
-			return fmt.Errorf("bad offset %q: %w", s, err)
-		}
-		offs = append(offs, v)
-	}
+func blockRefs(data []byte, offs []uint64, w io.Writer) error {
 	var payloads [][]byte
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		payloads = append(payloads, b.Payload)
@@ -53,4 +45,17 @@ func blockRefs(data []byte, list string, w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// parseOffsets parses a comma-separated list of decimal file offsets.
+func parseOffsets(list string) ([]uint64, error) {
+	var offs []uint64
+	for _, s := range strings.Split(list, ",") {
+		v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad offset %q: %w", s, err)
+		}
+		offs = append(offs, v)
+	}
+	return offs, nil
 }

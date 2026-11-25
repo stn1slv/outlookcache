@@ -1,0 +1,163 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/stn1slv/outlookcache/internal/hxtest"
+)
+
+func u64(v uint64) []byte { return binary.LittleEndian.AppendUint64(nil, v) }
+func u32(v uint32) []byte { return binary.LittleEndian.AppendUint32(nil, v) }
+
+// folderRecord builds a synthetic form 1 child folder record.
+func folderRecord(parent, id, owner uint64, sortKey []byte, name string) []byte {
+	return bytes.Join([][]byte{
+		{0xe3, 0x01},
+		make([]byte, 8), u64(parent), sortKey, encodeU16(name),
+		{0, 0},
+		{0x01, 0x8c, 0x05, 0, 0, 0x05, 0x00, 0xd8, 0x04, 0x8c, 0x05, 0, 0, 0, 0, 0x4d},
+		make([]byte, 9),
+		u64(id), u32(2), u64(owner), make([]byte, 16),
+	}, nil)
+}
+
+func TestParseFolderRecords(t *testing.T) {
+	t.Parallel()
+	const parent, id, owner = 0x18757ba5, 0x1880955b, 0x18757ba5
+	// The sort key holds a zero byte inside, as real keys do.
+	key := []byte{0x0e, 0x7c, 0x00, 0x0a, 0x0e, 0x0a, 0x01, 0x12, 0x00}
+	p := append([]byte{1, 2, 3}, folderRecord(parent, id, owner, key, "oc-probe-folder")...)
+	recs := parseFolderRecords(p, 4096)
+	require.Len(t, recs, 1)
+	assert.Equal(t, folderRec{id: id, parent: parent, owner: owner, name: "oc-probe-folder", block: 4096}, recs[0])
+
+	bad := folderRecord(parent, id, owner, key, "oc-probe-folder")
+	bad[len(bad)-16-8-4-8-9-1] = 0x4c // break the 0x4d marker
+	assert.Empty(t, parseFolderRecords(bad, 0))
+	noHead := folderRecord(parent, id, owner, key, "oc-probe-folder")
+	noHead[0] = 0
+	assert.Empty(t, parseFolderRecords(noHead, 0))
+}
+
+func TestTreeNamePrintsOnlyWholeSafeNames(t *testing.T) {
+	t.Parallel()
+	r := testRedactor()
+	assert.Equal(t, `"oc-probe-folder"`, treeName(r, "oc-probe-folder"))
+	assert.Equal(t, `"Inbox"`, treeName(r, "Inbox"))
+	for _, real := range []string{"oc-probe-folder secret plans", "oc-probe Bob", "Budget", "Отчёты"} {
+		got := treeName(r, real)
+		assert.NotContains(t, got, real)
+		assert.NotContains(t, got, "secret")
+		assert.NotContains(t, got, "Bob")
+	}
+}
+
+func TestNameFindPrintsNoText(t *testing.T) {
+	t.Parallel()
+	frame := bytes.Join([][]byte{
+		objMagic, u64(0x18800001),
+		{0xc7, 0x00},
+		u32(0), // length patched below
+		encodeU16("Bob Secret"), encodeU16("Alice Example"), encodeU16(" sent mail"),
+		u32(0x80000000 | uint32(len(encodeU16("Alice Example"))+2)),
+		{0, 0},
+		encodeU16("Alice Example"),
+		{0, 0},
+	}, nil)
+	binary.LittleEndian.PutUint32(frame[14:], uint32(len(frame)))
+	data := hxtest.File(hxtest.Block(8, 0x18800001, frame))
+	var out bytes.Buffer
+	require.NoError(t, nameFind(data, "alice example", &out))
+	got := out.String()
+	for _, secret := range []string{
+		"Alice", "alice", "Bob", "Secret", "sent",
+		hex.EncodeToString(encodeU16("Bo")), hex.EncodeToString(encodeU16("et")), hex.EncodeToString(encodeU16(" s")),
+	} {
+		assert.NotContains(t, strings.ToLower(got), strings.ToLower(secret))
+	}
+	assert.Contains(t, got, "frame[id=18800001 type=0x00c7")
+	assert.Contains(t, got, "prefix=length-prefixed")
+	assert.Contains(t, got, "prefix=-")
+}
+
+func TestFindNameOneByteAtEnd(t *testing.T) {
+	t.Parallel()
+	p := []byte("xxzz")
+	counts := map[string]int{}
+	require.NotPanics(t, func() { findName(p, asciiLower(p), 0, needle{encUTF8, []byte("z"), "z"}, counts) })
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	assert.Equal(t, 2, total, "adjacent one-byte matches")
+}
+
+func TestReadLiveIndexRejectsBadHeader(t *testing.T) {
+	t.Parallel()
+	data := make([]byte, 0x400)
+	binary.LittleEndian.PutUint64(data[hdrAreaA:], 0x100)
+	for _, b := range []uint64{0, 0x80, 0x100, 0x3ff, 1 << 62, ^uint64(0)} {
+		binary.LittleEndian.PutUint64(data[hdrAreaB:], b)
+		require.NotPanics(t, func() {
+			_, err := readLiveIndex(data)
+			assert.Error(t, err, "b=%#x", b)
+		})
+	}
+	binary.LittleEndian.PutUint64(data[hdrAreaB:], 0x200)
+	binary.LittleEndian.PutUint32(data[0x123:], 0x30) // block at 0x3000, any alignment
+	li, err := readLiveIndex(data)
+	require.NoError(t, err)
+	assert.True(t, li.indexed(0x3000, 0))
+	assert.False(t, li.indexed(0x3000, 1))
+	assert.False(t, li.indexed(0x3010, 0), "not on a 256-byte boundary")
+}
+
+func TestCurrentCopyRule(t *testing.T) {
+	t.Parallel()
+	li := liveIndex{areas: [2]map[uint32]bool{{0x30: true}, {}}}
+	indexed := c7copy{block: 0x3000, stamp: 1, status: 0x82}
+	newer := c7copy{block: 0x4000, stamp: 2, status: 0x80}
+	c, ok, amb := li.current([]c7copy{newer, indexed})
+	assert.Equal(t, indexed, c)
+	assert.True(t, ok)
+	assert.False(t, amb)
+
+	tieA := c7copy{block: 0x5000, stamp: 3, status: 0x80}
+	tieB := c7copy{block: 0x6000, stamp: 3, status: 0x82}
+	_, ok, amb = li.current([]c7copy{tieA, tieB})
+	assert.False(t, ok)
+	assert.True(t, amb, "same stamp, different read state")
+}
+
+func TestTextUnit(t *testing.T) {
+	t.Parallel()
+	for _, r := range "Aя7中" {
+		assert.True(t, textUnit(uint16(r)), "%q", r)
+	}
+	for _, v := range []uint16{0, 0x0002, 0x0300, 0x2000} {
+		assert.False(t, textUnit(v), "%#x", v)
+	}
+}
+
+func TestMatchCommandsNeedEnv(t *testing.T) { //nolint:paralleltest // t.Setenv
+	t.Setenv(matchEnv, "")
+	f := filepath.Join(t.TempDir(), "x.hxd")
+	require.NoError(t, os.WriteFile(f, hxtest.File(), 0o600))
+	for _, c := range []string{"namefind", "addrcount"} {
+		err := run(context.Background(), []string{c, "-file", f}, &bytes.Buffer{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), matchEnv)
+	}
+	err := run(context.Background(), []string{"framesin", "-file", f}, &bytes.Buffer{})
+	assert.ErrorContains(t, err, "-block")
+}

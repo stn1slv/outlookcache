@@ -6,20 +6,24 @@
 // Usage:
 //
 //	hxdiscover snap  -out file [-store path]
-//	hxdiscover stats|objects|check|folderlist|folders [-store path | -file copy]
+//	hxdiscover stats|objects|check|index|shifted|folderlist|folders|tree [-store path | -file copy]
 //	hxdiscover find    -marker oc-probe... [-before 1024] [-after 3072] [-max 5] [-block offset]
-//	hxdiscover diff    -file a -b b -marker oc-probe... [-key blockkey]
+//	hxdiscover diff    -file a -b b -marker oc-probe... [-key hexkey]
 //	hxdiscover records -marker oc-probe... -probes rel:len,...
 //	hxdiscover values  -values n,n [-marker oc-probe...]
 //	hxdiscover ids|frames -marker oc-probe...
-//	hxdiscover byid|around -value hex [-key blockkey]
-//	hxdiscover obj     -value hex -type hex
-//	hxdiscover fieldcmp|idslots -type hex [-value hex]
-//	hxdiscover index|shifted
+//	hxdiscover byid|around -value hex [-key hexkey]
+//	hxdiscover obj|idslots -value hex -type hex
+//	hxdiscover fieldcmp -type hex
+//	hxdiscover index   [-value messageid]
 //	hxdiscover refs    -values offset,offset
 //	hxdiscover slots   -values folder:owner,folder:owner
 //	hxdiscover framesin|refslots -block offset
-//	hxdiscover head    -block offset [-after n]
+//	hxdiscover entryrefs -value blockkey (0 = all blocks)
+//	HXD_MATCH=text hxdiscover namefind|addrcount   (tree marks matches when HXD_MATCH is set)
+//
+// Real names and addresses are passed only through HXD_MATCH and are never
+// printed.
 package main
 
 import (
@@ -68,17 +72,17 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 	store := fs.String("store", defaultStore(), "path of the live HxStore.hxd (copied before reading)")
 	file := fs.String("file", "", "read this existing private copy instead of copying -store")
 	out := fs.String("out", "", "snap: where to write the copy")
-	marker := fs.String("marker", "", "find: synthetic marker text")
+	marker := fs.String("marker", "", "synthetic marker text, must start with \"oc-probe\"")
 	before := fs.Int("before", 1024, "find: bytes shown before each hit")
 	after := fs.Int("after", 3072, "find: bytes shown after each hit")
-	maxHits := fs.Int("max", 5, "find: maximum hits shown")
-	blockOff := fs.Int64("block", -1, "find: only this block offset")
-	blockKey := fs.Int64("key", -1, "diff: only blocks with this key")
+	maxHits := fs.Int("max", 5, "find, around: maximum hits shown")
+	blockOff := fs.Int64("block", -1, "find, framesin, refslots: block file offset (decimal)")
+	keyHex := fs.String("key", "", "diff, around: only blocks with this key (hex)")
 	showTicks := fs.Bool("ticks", false, "print exact times of recent .NET ticks (may belong to real mail)")
 	other := fs.String("b", "", "diff: second private copy (the first is -file)")
-	typeHex := fs.String("type", "", "obj: object type in hex")
-	valueHex := fs.String("value", "", "around: u64 value in hex")
-	valueList := fs.String("values", "", "values: comma-separated u32 values")
+	typeHex := fs.String("type", "", "obj, idslots, fieldcmp: object type (hex)")
+	valueHex := fs.String("value", "", "byid, around, obj, idslots, index, entryrefs: u64 ID or key (hex)")
+	valueList := fs.String("values", "", "values: u32 list; refs: offsets; slots: folder:owner pairs")
 	probeSpec := fs.String("probes", "", "records: rel:len,rel:len byte ranges relative to the marker")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -111,6 +115,20 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		}
 		return v, nil
 	}
+	var key keyFilter
+	if *keyHex != "" {
+		v, err := parseHex(*keyHex, 64)
+		if err != nil {
+			return err
+		}
+		key = keyFilter{set: true, key: v}
+	}
+	needBlock := func() error {
+		if *blockOff < 0 {
+			return errors.New(args[0] + " needs -block with a block file offset")
+		}
+		return nil
+	}
 	switch args[0] {
 	case "diff":
 		m, err := needMarker(false)
@@ -125,7 +143,7 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			if err != nil {
 				return err
 			}
-			return diffSnapshots(data, b, redactor{marker: m, now: now, showTicks: *showTicks}, *blockKey, w)
+			return diffSnapshots(data, b, redactor{marker: m, now: now, showTicks: *showTicks}, key, w)
 		}
 	case "values":
 		m, err := needMarker(true)
@@ -182,13 +200,17 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			cmd = func(data []byte) error { return framesByID(data, v, w) }
 		} else {
 			cmd = func(data []byte) error {
-				return around(data, probeRedactor, v, *blockKey, *before, *after, *maxHits, w)
+				return around(data, probeRedactor, v, key, *before, *after, *maxHits, w)
 			}
 		}
 	case "shifted":
 		cmd = func(data []byte) error { return shifted(data, w) }
 	case "refs":
-		cmd = func(data []byte) error { return blockRefs(data, *valueList, w) }
+		offs, err := parseOffsets(*valueList)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return blockRefs(data, offs, w) }
 	case "index":
 		var show uint64
 		if *valueHex != "" {
@@ -200,7 +222,11 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		}
 		cmd = func(data []byte) error { return indexCheck(data, show, w) }
 	case "slots":
-		cmd = func(data []byte) error { return slots(data, *valueList, w) }
+		pairs, err := parsePairs(*valueList)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return slots(data, pairs, w) }
 	case "idslots":
 		v, err := parseHex(*valueHex, 64)
 		if err != nil {
@@ -211,35 +237,34 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 			return err
 		}
 		cmd = func(data []byte) error { return idSlots(data, v, uint16(t), w) }
-	case "framesin":
-		cmd = func(data []byte) error { return framesIn(data, *blockOff, w) }
-	case "head":
-		cmd = func(data []byte) error { return payloadHead(data, probeRedactor, *blockOff, *after, w) }
-	case "refslots":
-		cmd = func(data []byte) error { return refSlots(data, *blockOff, w) }
+	case "framesin", "refslots":
+		if err := needBlock(); err != nil {
+			return err
+		}
+		if args[0] == "framesin" {
+			cmd = func(data []byte) error { return framesIn(data, *blockOff, w) }
+		} else {
+			cmd = func(data []byte) error { return refSlots(data, *blockOff, w) }
+		}
 	case "entryrefs":
 		v, err := parseHex(*valueHex, 64)
 		if err != nil {
 			return err
 		}
 		cmd = func(data []byte) error { return entryRefs(data, v, w) }
-	case "namefind":
-		if *marker == "" {
-			return errors.New("namefind needs -marker with a known folder name")
-		}
-		name := *marker
-		cmd = func(data []byte) error { return nameFind(data, name, w) }
-	case "tree":
-		cmd = func(data []byte) error { return folderTree(data, probeRedactor, *marker, w) }
-	case "keys":
-		t, err := parseHex(*typeHex, 16)
+	case "namefind", "addrcount":
+		text, err := matchText()
 		if err != nil {
 			return err
 		}
-		cmd = func(data []byte) error { return commonKeys(data, uint16(t), max(3, *maxHits), w) }
-	case "addrcount":
-		text := *marker
-		cmd = func(data []byte) error { return addrCount(data, text, w) }
+		if args[0] == "namefind" {
+			cmd = func(data []byte) error { return nameFind(data, text, w) }
+		} else {
+			cmd = func(data []byte) error { return addrCount(data, text, w) }
+		}
+	case "tree":
+		match := os.Getenv(matchEnv)
+		cmd = func(data []byte) error { return folderTree(data, probeRedactor, match, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":

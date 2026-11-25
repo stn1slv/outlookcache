@@ -17,21 +17,27 @@ import (
 // collects the positions (framing type, offset in framing) where the folder
 // ID appears inside framings whose ID is in the owner set. Positions shared
 // by all pairs are candidates for a fixed role slot.
-func slots(data []byte, spec string, w io.Writer) error {
-	type pair struct{ folder, owner uint64 }
-	var pairs []pair
+type folderPair struct{ folder, owner uint64 }
+
+// parsePairs parses "folder:owner,folder:owner" (hex IDs).
+func parsePairs(spec string) ([]folderPair, error) {
+	var pairs []folderPair
 	for _, s := range strings.Split(spec, ",") {
 		f, o, ok := strings.Cut(strings.TrimSpace(s), ":")
 		if !ok {
-			return fmt.Errorf("bad pair %q, want folder:owner in hex", s)
+			return nil, fmt.Errorf("bad pair %q, want folder:owner in hex", s)
 		}
 		fv, err1 := strconv.ParseUint(f, 16, 64)
 		ov, err2 := strconv.ParseUint(o, 16, 64)
 		if err1 != nil || err2 != nil {
-			return fmt.Errorf("bad pair %q", s)
+			return nil, fmt.Errorf("bad pair %q, want folder:owner in hex", s)
 		}
-		pairs = append(pairs, pair{fv, ov})
+		pairs = append(pairs, folderPair{fv, ov})
 	}
+	return pairs, nil
+}
+
+func slots(data []byte, pairs []folderPair, w io.Writer) error {
 	found := make([]map[string]bool, len(pairs))
 	for i := range found {
 		found[i] = map[string]bool{}
@@ -139,10 +145,12 @@ func idSlots(data []byte, id uint64, typ uint16, w io.Writer) error {
 
 // framesIn lists the framings of the block at this file offset.
 func framesIn(data []byte, blockOff int64, w io.Writer) error {
+	found := false
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		if b.Offset != blockOff {
 			return nil
 		}
+		found = true
 		p := b.Payload
 		_, _ = fmt.Fprintf(w, "block@%d key=%x type=%d payload=%d\n", b.Offset, b.Key, b.Type, len(p))
 		for off := 0; ; {
@@ -156,29 +164,27 @@ func framesIn(data []byte, blockOff int64, w io.Writer) error {
 				binary.LittleEndian.Uint16(p[o+12:]), binary.LittleEndian.Uint32(p[o+14:]))
 		}
 	})
-	return err
+	return blockFound(found, blockOff, err)
 }
 
-// payloadHead dumps the first n payload bytes of the block at this offset,
-// redacted.
-func payloadHead(data []byte, r redactor, blockOff int64, n int, w io.Writer) error {
-	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
-		if b.Offset != blockOff {
-			return nil
-		}
-		dump(w, r, b.Payload[:min(n, len(b.Payload))], 0, 0)
-		return hxstore.ErrStop
-	})
+// blockFound turns a missing block into an error, so a wrong -block offset
+// is not mistaken for an empty result.
+func blockFound(found bool, blockOff int64, err error) error {
+	if err == nil && !found {
+		return fmt.Errorf("no valid block starts at offset %d", blockOff)
+	}
 	return err
 }
 
 // refSlots lists object references in the unframed head of a block (before
 // the first framing): [type u16][8 zero bytes][id][u32 2][owner][id][owner].
 func refSlots(data []byte, blockOff int64, w io.Writer) error {
+	found := false
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		if b.Offset != blockOff {
 			return nil
 		}
+		found = true
 		p := b.Payload
 		end := bytes.Index(p, objMagic)
 		if end < 0 {
@@ -195,7 +201,7 @@ func refSlots(data []byte, blockOff int64, w io.Writer) error {
 		}
 		return hxstore.ErrStop
 	})
-	return err
+	return blockFound(found, blockOff, err)
 }
 
 // entryRefs lists named folder entries in blocks keyed by key: folder ID,
