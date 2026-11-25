@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
 	"fmt"
 	"io"
 
@@ -127,22 +126,8 @@ func printRanges(w io.Writer, r redactor, x, y window) {
 	}
 }
 
-// safeHex prints bytes as hex unless they look like UTF-8 or UTF-16LE text.
-func safeHex(b []byte) string {
-	printable, u16 := 0, 0
-	for i, c := range b {
-		if c >= 0x20 && c < 0x7f {
-			printable++
-			if i+1 < len(b) && b[i+1] == 0 {
-				u16++
-			}
-		}
-	}
-	if len(b) >= 4 && (printable*10 > len(b)*8 || u16 >= 3) {
-		return fmt.Sprintf("<text-like %d bytes>", len(b))
-	}
-	return hex.EncodeToString(b)
-}
+// safeHex prints bytes as hex with every text span masked.
+func safeHex(b []byte) string { return maskHex(b) }
 
 func note(r redactor, b []byte) string {
 	for j := range b {

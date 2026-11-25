@@ -24,7 +24,9 @@ const SupportedVersion = 'i'
 const (
 	headerSize      = 0x40
 	blockHeaderSize = 0x28
-	// A block cannot be larger than the 32 MiB cap in the file header.
+	// Upper limit for compressed and decompressed block sizes. Outlook's
+	// header initialiser writes a 32 MiB cap (public spec); this package
+	// does not read it from the file.
 	maxBlockLen = 32 << 20
 )
 
@@ -63,8 +65,8 @@ func ParseHeader(data []byte) (Header, error) {
 // Block is one decoded block.
 type Block struct {
 	Offset  int64  // file offset of the block header
-	Type    uint32 // 8 = message data in the observed stores; 16 is rare
-	Key     uint64 // header +0x20: ID in the first object framing of the payload
+	Type    uint32 // 8 in all valid blocks observed; type 16 blocks never validated
+	Key     uint64 // header +0x20; equals the first framing ID when the payload starts with one
 	Payload []byte // decompressed payload
 }
 
@@ -93,7 +95,10 @@ type Stats struct {
 func Scan(data []byte, file string, fn func(Block) error) (Stats, []Damage, error) {
 	st := Stats{ByType: map[uint32]int{}}
 	var damage []Damage
-	pos := 8
+	if len(data) < headerSize+8 {
+		return st, nil, nil
+	}
+	pos := headerSize + 8 // a block cannot start inside the file header
 	for {
 		k := bytes.Index(data[pos:], blockMagic)
 		if k < 0 {
@@ -102,9 +107,6 @@ func Scan(data []byte, file string, fn func(Block) error) (Stats, []Damage, erro
 		hit := pos + k
 		pos = hit + 1
 		start := hit - 8
-		if start < headerSize {
-			continue
-		}
 		st.Candidates++
 		blk, n, reason := decodeBlock(data, start)
 		if reason != "" {
@@ -135,11 +137,12 @@ func decodeBlock(data []byte, start int) (Block, int, string) {
 		return Block{}, blockHeaderSize, "header crc mismatch"
 	}
 	typ := binary.LittleEndian.Uint32(h[0x10:])
-	plen := int(binary.LittleEndian.Uint32(h[0x14:]))
-	ilen := int(binary.LittleEndian.Uint32(h[0x18:]))
-	if plen > maxBlockLen || ilen > maxBlockLen {
+	plen32 := binary.LittleEndian.Uint32(h[0x14:])
+	ilen32 := binary.LittleEndian.Uint32(h[0x18:])
+	if plen32 > maxBlockLen || ilen32 > maxBlockLen { // compare before int conversion
 		return Block{}, blockHeaderSize, "length over 32 MiB cap"
 	}
+	plen, ilen := int(plen32), int(ilen32)
 	size := blockHeaderSize + plen
 	if len(data)-start < size {
 		return Block{}, len(data) - start, "truncated payload"

@@ -1,18 +1,24 @@
 // Command hxdiscover is a development tool for reverse engineering
 // HxStore.hxd. It reads a private copy of the store and prints counts,
-// offsets and redacted shapes only. It is not shipped in releases.
+// offsets, masked hex and redacted shapes only. It is not shipped in
+// releases. Markers must start with "oc-probe" (synthetic test mail).
 //
 // Usage:
 //
-//	hxdiscover stats [-store path]
 //	hxdiscover snap  -out file [-store path]
-//	hxdiscover find  -marker oc-probe [-store path | -file copy] [-before 1024] [-after 3072] [-max 5]
+//	hxdiscover stats|objects|check|folderlist|folders [-store path | -file copy]
+//	hxdiscover find    -marker oc-probe... [-before 1024] [-after 3072] [-max 5] [-block offset]
+//	hxdiscover diff    -file a -b b -marker oc-probe... [-key blockkey]
+//	hxdiscover records -marker oc-probe... -probes rel:len,...
+//	hxdiscover values  -values n,n [-marker oc-probe...]
+//	hxdiscover ids|frames -marker oc-probe...
+//	hxdiscover byid|around -value hex
+//	hxdiscover obj     -value hex -type hex
 package main
 
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +29,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,7 +45,7 @@ func defaultStore() string {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	err := run(ctx, os.Args[1:], os.Stdout)
 	stop()
 	if err != nil {
@@ -49,7 +56,7 @@ func main() {
 
 func run(ctx context.Context, args []string, w io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hxdiscover stats|snap|find [flags]")
+		return errors.New("usage: hxdiscover <command> [flags], see the package comment")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	store := fs.String("store", defaultStore(), "path of the live HxStore.hxd (copied before reading)")
@@ -59,13 +66,22 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 	before := fs.Int("before", 1024, "find: bytes shown before each hit")
 	after := fs.Int("after", 3072, "find: bytes shown after each hit")
 	maxHits := fs.Int("max", 5, "find: maximum hits shown")
-	blockOff := fs.Int64("block", -1, "find: only this block offset; diff: only this block key")
+	blockOff := fs.Int64("block", -1, "find: only this block offset")
+	blockKey := fs.Int64("key", -1, "diff: only blocks with this key")
+	showTicks := fs.Bool("ticks", false, "print exact times of recent .NET ticks (may belong to real mail)")
 	other := fs.String("b", "", "diff: second private copy (the first is -file)")
+	typeHex := fs.String("type", "", "obj: object type in hex")
+	valueHex := fs.String("value", "", "around: u64 value in hex")
 	valueList := fs.String("values", "", "values: comma-separated u32 values")
 	probeSpec := fs.String("probes", "", "records: rel:len,rel:len byte ranges relative to the marker")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if *before < 0 || *after < 0 || *maxHits < 0 {
+		return errors.New("-before, -after and -max must not be negative")
+	}
+	now := time.Now()
+	probeRedactor := redactor{marker: markerPrefix, now: now, showTicks: *showTicks}
 
 	if args[0] == "snap" {
 		if *out == "" {
@@ -74,72 +90,133 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		return snap(ctx, *store, *out, w)
 	}
 
-	data, cleanup, err := load(ctx, *store, *file)
-	if err != nil {
-		return err
+	// Validate everything before the store is copied.
+	var cmd func(data []byte) error
+	needMarker := func(optional bool) (string, error) {
+		if optional && *marker == "" {
+			return "", nil
+		}
+		return checkMarker(*marker)
 	}
-	defer cleanup()
-
+	parseHex := func(s string, bits int) (uint64, error) {
+		v, err := strconv.ParseUint(s, 16, bits)
+		if err != nil {
+			return 0, fmt.Errorf("bad hex value %q: %w", s, err)
+		}
+		return v, nil
+	}
 	switch args[0] {
 	case "diff":
-		if len(*marker) < 6 || *other == "" || *file == "" {
-			return errors.New("diff needs -file, -b and -marker")
-		}
-		b, err := os.ReadFile(*other) //nolint:gosec // dev tool: path from the developer's own flag
+		m, err := needMarker(false)
 		if err != nil {
 			return err
 		}
-		return diffSnapshots(data, b, redactor{marker: strings.ToLower(*marker), now: time.Now()}, *blockOff, w)
+		if *other == "" || *file == "" {
+			return errors.New("diff needs -file and -b")
+		}
+		cmd = func(data []byte) error {
+			b, err := os.ReadFile(*other) //nolint:gosec // dev tool: path from the developer's own flag
+			if err != nil {
+				return err
+			}
+			return diffSnapshots(data, b, redactor{marker: m, now: now, showTicks: *showTicks}, *blockKey, w)
+		}
 	case "values":
-		return values(data, strings.ToLower(*marker), *valueList, w)
-	case "check":
-		return check(data, w)
-	case "objects":
-		return objects(data, w)
-	case "records":
-		probes, err := parseProbes(*probeSpec)
+		m, err := needMarker(true)
 		if err != nil {
 			return err
 		}
-		return records(data, *marker, probes, w)
-	case "stats":
-		return stats(data, w)
-	case "find":
-		if len(*marker) < 6 {
-			return errors.New("find needs -marker with at least 6 characters")
+		cmd = func(data []byte) error { return values(data, m, *valueList, w) }
+	case "ids", "frames", "records", "find":
+		m, err := needMarker(false)
+		if err != nil {
+			return err
 		}
-		r := redactor{marker: strings.ToLower(*marker), now: time.Now()}
-		return find(data, r, *before, *after, *maxHits, *blockOff, w)
+		switch args[0] {
+		case "ids":
+			cmd = func(data []byte) error { return ids(data, m, w) }
+		case "frames":
+			cmd = func(data []byte) error { return frames(data, m, w) }
+		case "records":
+			probes, err := parseProbes(*probeSpec)
+			if err != nil {
+				return err
+			}
+			cmd = func(data []byte) error { return records(data, m, probes, w) }
+		default:
+			r := redactor{marker: m, now: now, showTicks: *showTicks}
+			cmd = func(data []byte) error { return find(data, r, *before, *after, *maxHits, *blockOff, w) }
+		}
+	case "folders":
+		cmd = func(data []byte) error { return folderObjects(data, probeRedactor, w) }
+	case "folderlist":
+		cmd = func(data []byte) error { return folderList(data, probeRedactor, w) }
+	case "obj":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		t, err := parseHex(*typeHex, 16)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return dumpObject(data, probeRedactor, v, uint16(t), w) }
+	case "byid", "around":
+		v, err := parseHex(*valueHex, 64)
+		if err != nil {
+			return err
+		}
+		if args[0] == "byid" {
+			cmd = func(data []byte) error { return framesByID(data, v, w) }
+		} else {
+			cmd = func(data []byte) error { return around(data, probeRedactor, v, *before, *after, *maxHits, w) }
+		}
+	case "check":
+		cmd = func(data []byte) error { return check(data, w) }
+	case "objects":
+		cmd = func(data []byte) error { return objects(data, w) }
+	case "stats":
+		cmd = func(data []byte) error { return stats(data, w) }
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+
+	data, err := load(ctx, *store, *file)
+	if err != nil {
+		return err
+	}
+	return cmd(data)
 }
 
-// load returns the bytes of a private copy of the store.
-func load(ctx context.Context, store, file string) ([]byte, func(), error) {
+// load returns the bytes of a private copy of the store. The temp copy is
+// removed as soon as it is in memory, so an interrupted scan leaves nothing.
+func load(ctx context.Context, store, file string) ([]byte, error) {
 	if file != "" {
-		data, err := os.ReadFile(file) //nolint:gosec // dev tool: paths come from the developer's own flags
-		return data, func() {}, err
+		return os.ReadFile(file) //nolint:gosec // dev tool: paths come from the developer's own flags
 	}
 	s, err := snapshot.New()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	cleanup := func() { _ = s.Close() }
+	defer func() { _ = s.Close() }()
 	p, err := s.Copy(ctx, store)
 	if err != nil {
-		cleanup()
-		return nil, nil, err
+		return nil, err
 	}
-	data, err := os.ReadFile(p) //nolint:gosec // dev tool: paths come from the developer's own flags
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return data, cleanup, nil
+	return os.ReadFile(p) //nolint:gosec // dev tool: paths come from the developer's own flags
 }
 
+// snap writes a private copy of the store to out. It refuses an existing
+// target and any target inside the Office group container, so a flag
+// mistake can never replace Outlook's files.
 func snap(ctx context.Context, store, out string, w io.Writer) error {
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(abs, "/Group Containers/UBF8T346G9.Office/") {
+		return fmt.Errorf("refusing to write inside the Office group container: %s", abs)
+	}
 	s, err := snapshot.New()
 	if err != nil {
 		return err
@@ -150,11 +227,30 @@ func snap(ctx context.Context, store, out string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(p, out); err != nil { //nolint:gosec // dev tool: paths come from the developer's own flags
+	if err := copyNew(p, abs); err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(w, "copied in %s to %s\n", time.Since(start).Round(time.Millisecond), out)
+	_, _ = fmt.Fprintf(w, "copied in %s to %s\n", time.Since(start).Round(time.Millisecond), abs)
 	return nil
+}
+
+// copyNew copies src to a new file dst (0600); it fails if dst exists.
+func copyNew(src, dst string) error {
+	in, err := os.Open(src) //nolint:gosec // dev tool: our own snapshot copy
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // dev tool: path from the developer's own flag
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst) //nolint:gosec // dev tool: path from the developer's own flag
+		return err
+	}
+	return out.Close()
 }
 
 var itemClassU16 = regexp.MustCompile(`I\x00P\x00[MF]\x00\.\x00(?:[A-Za-z0-9._-]\x00){1,60}`)
@@ -224,7 +320,7 @@ func encodeU16(s string) []byte {
 }
 
 // find prints a redacted, tokenized window around each payload position
-// where the marker occurs (UTF-16LE or UTF-8, case as given).
+// where the marker occurs (UTF-16LE or UTF-8, ASCII case-insensitive).
 func find(data []byte, r redactor, before, after, maxHits int, blockOff int64, w io.Writer) error {
 	needles := [][]byte{encodeU16(r.marker), []byte(r.marker)}
 	shown, total := 0, 0
@@ -271,16 +367,19 @@ func dump(w io.Writer, r redactor, span []byte, base, hit int) {
 	}
 }
 
+// dumpBinary prints a binary gap as hex, 32 bytes per line, with every span
+// that decodes as text masked.
 func dumpBinary(w io.Writer, r redactor, raw []byte, rel int) {
+	mask := textMask(raw)
 	for i := 0; i < len(raw); i += 32 {
-		chunk := raw[i:min(len(raw), i+32)]
+		end := min(len(raw), i+32)
 		var notes []string
-		for j := range chunk {
-			if n, ok := r.tickNote(raw[i+j:]); ok {
-				notes = append(notes, fmt.Sprintf("+%d:%s", j, n))
+		for j := i; j < end; j++ {
+			if n, ok := r.tickNote(raw[j:]); ok {
+				notes = append(notes, fmt.Sprintf("+%d:%s", j-i, n))
 			}
 		}
-		line := fmt.Sprintf("%+6d bin %s", rel+i, hex.EncodeToString(chunk))
+		line := fmt.Sprintf("%+6d bin %s", rel+i, renderHex(raw[i:end], mask[i:end]))
 		if len(notes) > 0 {
 			line += "  " + strings.Join(notes, " ")
 		}

@@ -12,6 +12,7 @@ import (
 type c7copy struct {
 	stamp        uint64
 	status, flag byte
+	folder       uint64
 }
 
 // check splits 0xc7 objects into standalone (framing id == block key) and
@@ -35,17 +36,20 @@ func check(data []byte, w io.Writer) error {
 			if typ != 0xc7 || o+n > len(p) || n < 1800 {
 				continue
 			}
-			form, shift := "standalone", 0
-			if id != b.Key {
-				form, shift = "embedded", -10
+			ref := binary.LittleEndian.Uint64(p[o+32:])
+			if ref < 0x18000000 || ref >= 0x19000000 {
+				hist["parent form (skipped)"]++
+				continue
 			}
-			s := p[o+1772+shift]
-			f := p[o+1742+shift]
+			const form = "message"
+			s := p[o+1772]
+			f := p[o+1742]
 			hist[fmt.Sprintf("%s status=0x%02x", form, s)]++
 			hist[fmt.Sprintf("%s flag=0x%02x", form, f)]++
 			var sb [8]byte
-			copy(sb[:6], p[o+370+shift:])
-			copies[id] = append(copies[id], c7copy{binary.LittleEndian.Uint64(sb[:]), s, f})
+			copy(sb[:6], p[o+370:])
+			folder := binary.LittleEndian.Uint64(p[o+1166:])
+			copies[id] = append(copies[id], c7copy{binary.LittleEndian.Uint64(sb[:]), s, f, folder})
 		}
 	})
 	if err != nil {
@@ -53,25 +57,65 @@ func check(data []byte, w io.Writer) error {
 	}
 	printCounts(w, "0xc7 by form", hist)
 	ids, conflicts, stamps := 0, 0, map[uint64]bool{}
+	diffKinds := map[string]int{}
+	zeroStamp := 0
 	for _, cs := range copies {
 		ids++
-		var top c7copy
+		top := cs[0]
 		for _, c := range cs {
 			if c.stamp > top.stamp {
 				top = c
 			}
 		}
+		if top.stamp == 0 {
+			zeroStamp++
+		}
 		stamps[top.stamp] = true
 		for _, c := range cs {
-			if c.stamp == top.stamp && (c.status != top.status || c.flag != top.flag) {
+			if c.stamp == top.stamp && (c.status != top.status || c.flag != top.flag || c.folder != top.folder) {
 				conflicts++
+				what := ""
+				if c.status != top.status {
+					what += fmt.Sprintf(" status %02x/%02x", c.status, top.status)
+				}
+				if c.flag != top.flag {
+					what += " flag"
+				}
+				if c.folder != top.folder {
+					what += " folder"
+				}
+				diffKinds[what]++
 				break
 			}
 		}
 	}
+	folders := map[string]int{}
+	unread := 0
+	for _, cs := range copies {
+		top := cs[0]
+		for _, c := range cs {
+			if c.stamp > top.stamp {
+				top = c
+			}
+		}
+		key := fmt.Sprintf("%x", top.folder)
+		if top.status&0x02 == 0 {
+			unread++
+			key += " unread"
+		}
+		folders[key]++
+	}
+	_, _ = fmt.Fprintf(w, "current copies: unread(bit 0x02 clear)=%d distinct folders=%d\n", unread, len(folders))
+	printCounts(w, "current copies per folder id", folders)
 	_, _ = fmt.Fprintf(w, "0xc7 ids=%d ids_with_conflicting_top_copies=%d distinct_top_stamps=%d\n", ids, conflicts, len(stamps))
+	printCounts(w, "conflict kinds", diffKinds)
+	_, _ = fmt.Fprintf(w, "ids whose newest stamp is 0: %d\n", zeroStamp)
 	types := map[string]int{}
 	for _, d := range damage {
+		if d.Offset+0x28 > int64(len(data)) || d.Reason == "header crc mismatch" {
+			types["type=? "+d.Reason]++ // header unreadable or not trustworthy
+			continue
+		}
 		h := data[d.Offset : d.Offset+0x28]
 		types[fmt.Sprintf("type=%d %s", binary.LittleEndian.Uint32(h[0x10:]), d.Reason)]++
 	}

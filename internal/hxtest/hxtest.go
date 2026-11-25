@@ -74,8 +74,9 @@ func appendLen(out []byte, n int) []byte {
 	return append(out, byte(n))
 }
 
-// Block returns one valid block: 40-byte header, both CRCs, LZ4 payload.
-func Block(typ uint32, payload []byte) []byte {
+// Block returns one valid block: 40-byte header with the key at +0x20,
+// both CRCs, LZ4 payload.
+func Block(typ uint32, key uint64, payload []byte) []byte {
 	comp := EncodeLZ4(payload)
 	b := make([]byte, 0x28+len(comp))
 	copy(b[8:], BlockMagic)
@@ -83,6 +84,7 @@ func Block(typ uint32, payload []byte) []byte {
 	binary.LittleEndian.PutUint32(b[0x14:], uint32(len(comp)))
 	binary.LittleEndian.PutUint32(b[0x18:], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(b[0x1c:], 4)
+	binary.LittleEndian.PutUint64(b[0x20:], key)
 	copy(b[0x28:], comp)
 	binary.LittleEndian.PutUint32(b[4:], crc32.ChecksumIEEE(b[8:]))
 	binary.LittleEndian.PutUint32(b[0:], crc32.ChecksumIEEE(b[4:0x20]))

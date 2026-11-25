@@ -35,15 +35,16 @@ func parseProbes(s string) ([]probe, error) {
 }
 
 // records counts the distinct values of binary probes at fixed offsets from
-// each NUL-preceded UTF-16LE marker hit. Probes are binary fields of the
-// synthetic probe records, so printing them as hex is safe.
+// each NUL-preceded UTF-16LE marker hit (ASCII case-insensitive). Probes
+// can point anywhere, so their bytes go through safeHex, which masks text.
 func records(data []byte, marker string, probes []probe, w io.Writer) error {
 	needle := encodeU16(marker)
 	counts := map[string]int{}
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		p := b.Payload
+		low := asciiLower(p)
 		for off := 0; ; {
-			k := bytes.Index(p[off:], needle)
+			k := bytes.Index(low[off:], needle)
 			if k < 0 {
 				return nil
 			}
@@ -52,7 +53,7 @@ func records(data []byte, marker string, probes []probe, w io.Writer) error {
 			if hit < 2 || p[hit-1] != 0 || p[hit-2] != 0 {
 				continue
 			}
-			key := []string{fmt.Sprintf("@%d key=%d len=%d hdr=%x", b.Offset, b.Key, len(p), p[:min(16, len(p))])}
+			key := []string{fmt.Sprintf("@%d key=%d len=%d hdr=%s", b.Offset, b.Key, len(p), safeHex(p[:min(16, len(p))]))}
 			for _, pr := range probes {
 				lo, hi := hit+pr.rel, hit+pr.rel+pr.n
 				if lo < 0 || hi > len(p) {

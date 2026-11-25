@@ -38,3 +38,7 @@ go.work.sum
 
 # GoReleaser output
 /dist/
+
+# Copies of a real mail store must never be committed
+*.hxd
+*.hxd.*

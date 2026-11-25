@@ -26,7 +26,7 @@ func values(data []byte, marker, list string, w io.Writer) error {
 	counts := map[string]int{}
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		p := b.Payload
-		if len(needle) > 0 && !bytes.Contains(asciiLower(p), needle) {
+		if len(needle) > 0 && !bytes.Contains(asciiLower(p), needle) { // marker already checked by the caller
 			return nil
 		}
 		for _, v := range want {

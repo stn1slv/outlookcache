@@ -21,7 +21,7 @@ func objects(data []byte, w io.Writer) error {
 	_, _, err := hxstore.Scan(data, "HxStore.hxd", func(b hxstore.Block) error {
 		blocks++
 		p := b.Payload
-		if len(p) >= 20 && bytes.Equal(p[16:20], objMagic) {
+		if len(p) >= 28 && bytes.Equal(p[16:20], objMagic) {
 			atStart++
 			if binary.LittleEndian.Uint64(p[20:]) == b.Key {
 				keyMatch++

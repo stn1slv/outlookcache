@@ -8,10 +8,18 @@ import (
 // ErrLZ4 reports an LZ4 payload that does not decode to the declared length.
 var ErrLZ4 = errors.New("lz4: invalid block")
 
+// maxLZ4Ratio bounds how much LZ4 can expand: one extension byte adds at
+// most 255 output bytes.
+const maxLZ4Ratio = 255
+
 // DecodeLZ4 decodes one LZ4 block (no frame header) into exactly n bytes.
-// Any other outcome is an error: short or long output, a match distance that
-// points before the start of the output, or input left over at the end.
+// Any other outcome is an error: short or long output, or a match distance
+// that points before the start of the output. n is checked against
+// maxBlockLen and the input size before any memory is reserved.
 func DecodeLZ4(src []byte, n int) ([]byte, error) {
+	if n < 0 || n > maxBlockLen || n > maxLZ4Ratio*len(src)+16 {
+		return nil, fmt.Errorf("%w: declared size %d for %d input bytes", ErrLZ4, n, len(src))
+	}
 	dst := make([]byte, 0, n)
 	i := 0
 	for i < len(src) {
