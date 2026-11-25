@@ -231,6 +231,15 @@ func run(ctx context.Context, args []string, w io.Writer) error {
 		cmd = func(data []byte) error { return nameFind(data, name, w) }
 	case "tree":
 		cmd = func(data []byte) error { return folderTree(data, probeRedactor, *marker, w) }
+	case "keys":
+		t, err := parseHex(*typeHex, 16)
+		if err != nil {
+			return err
+		}
+		cmd = func(data []byte) error { return commonKeys(data, uint16(t), max(3, *maxHits), w) }
+	case "addrcount":
+		text := *marker
+		cmd = func(data []byte) error { return addrCount(data, text, w) }
 	case "check":
 		cmd = func(data []byte) error { return check(data, w) }
 	case "objects":
